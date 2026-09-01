@@ -1,6 +1,6 @@
 # sing-box for Home Assistant
 
-![sing-box](brands/icon.png)
+![sing-box](custom_components/singbox/brand/icon.png)
 
 Home Assistant integration that **monitors and controls** a running
 [sing-box](https://sing-box.sagernet.org/) instance. Distributed via
@@ -176,8 +176,9 @@ be met for it to be listed and updated correctly:
 
 Additional requirements depend on the repository type:
 
-- **Integrations** — a `brands` folder with brand assets (at least
-  `icon.png`) is required, and the integration must follow the Home Assistant
+- **Integrations** — a `brand` folder inside the integration directory
+  (`custom_components/<domain>/brand/`) with at least an `icon.png` is
+  required, and the integration must follow the Home Assistant
   `custom_components` development standards.
 - **Plugins (Lovelace) / Themes** — files must live in the directories HACS
   expects (e.g. `/www/community/`); `hacs.json` must correctly set
