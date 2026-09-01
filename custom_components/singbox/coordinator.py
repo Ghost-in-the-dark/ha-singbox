@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -36,6 +37,13 @@ _LOGGER = logging.getLogger(__package__)
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 60.0
 
+# Minimum time between coordinator -> entity state pushes. Backend streams
+# (clash WS /traffic, gRPC SubscribeStatus) can deliver frames every second;
+# forwarding each one through HA floods the state machine and the recorder
+# with writes, which over days grows the SQLite DB and HA's memory usage
+# until the host runs out of RAM.
+_PUSH_MIN_INTERVAL = 5.0
+
 
 class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
     """Manages the sing-box API connection and its push streams."""
@@ -55,6 +63,10 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self.backend = backend
         self.data = SingBoxStatus()
         self._stream_tasks: list[asyncio.Task] = []
+        # State pushes are throttled (see _PUSH_MIN_INTERVAL) so the 1s
+        # backend frames do not flood HA with writes.
+        self._push_interval = max(float(update_interval_seconds), _PUSH_MIN_INTERVAL)
+        self._last_push_ts = 0.0
         self.clash_mode_available = False
         self._groups_ready = asyncio.Event()
         # SubscribeStatus interval is a Go time.Duration, i.e. nanoseconds.
@@ -251,10 +263,18 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self.data.uplink_total = upload_total
         self.data.downlink_total = download_total
 
+    def _push_due(self) -> bool:
+        return time.monotonic() - self._last_push_ts >= self._push_interval
+
     def _mark_available(self) -> None:
-        if not self.last_update_success:
+        # Availability flips immediately; the data push itself is throttled so
+        # per-second stream frames do not generate a state write each time.
+        recovering = not self.last_update_success
+        if recovering:
             self.last_update_success = True
-        self.async_set_updated_data(self.data)
+        if recovering or self._push_due():
+            self._last_push_ts = time.monotonic()
+            self.async_set_updated_data(self.data)
 
     def _mark_unavailable(self, err: Exception | None) -> None:
         if self.last_update_success:
