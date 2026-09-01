@@ -15,7 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN, STATUS_INTERVAL_NS
+from .const import DEFAULT_UPDATE_INTERVAL, DOMAIN
 from .grpc import (
     GRPC_STATUS_NOT_FOUND,
     GRPC_STATUS_UNAUTHENTICATED,
@@ -37,7 +37,11 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
     """Manages the sing-box API connection and its push streams."""
 
     def __init__(
-        self, hass: HomeAssistant, entry: ConfigEntry, client: SingBoxClient
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        client: SingBoxClient,
+        update_interval_seconds: int = DEFAULT_UPDATE_INTERVAL,
     ) -> None:
         super().__init__(
             hass, _LOGGER, name=DOMAIN, update_interval=None, config_entry=entry
@@ -47,6 +51,9 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self._stream_tasks: list[asyncio.Task] = []
         self.clash_mode_available = False
         self._groups_ready = asyncio.Event()
+        # SubscribeStatus interval is a Go time.Duration, i.e. nanoseconds.
+        self._interval_seconds = update_interval_seconds
+        self._interval_ns = update_interval_seconds * 1_000_000_000
 
     async def async_setup(self) -> None:
         """Fetch static info and start the push streams."""
@@ -95,7 +102,7 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         backoff = _MIN_BACKOFF
         while True:
             try:
-                async for fields in self.client.subscribe_status(STATUS_INTERVAL_NS):
+                async for fields in self.client.subscribe_status(self._interval_ns):
                     self._apply_status(fields)
                     backoff = _MIN_BACKOFF
                     self._mark_available()
@@ -156,8 +163,10 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self.data.connections_in = _int(fields, 3)
         self.data.connections_out = _int(fields, 4)
         self.data.traffic_available = _bool(fields, 5)
-        self.data.uplink = _int(fields, 6)
-        self.data.downlink = _int(fields, 7)
+        # uplink/downlink are byte deltas since the previous frame; dividing by
+        # the frame interval yields bytes per second.
+        self.data.uplink = _int(fields, 6) / self._interval_seconds
+        self.data.downlink = _int(fields, 7) / self._interval_seconds
         self.data.uplink_total = _int(fields, 8)
         self.data.downlink_total = _int(fields, 9)
 

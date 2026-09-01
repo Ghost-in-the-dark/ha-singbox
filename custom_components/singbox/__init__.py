@@ -21,7 +21,12 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, PLATFORMS
+from .const import (
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
+    PLATFORMS,
+)
 from .coordinator import SingBoxCoordinator
 from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError, SingBoxClient
 
@@ -35,14 +40,27 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a sing-box config entry."""
+    # Options (set via the options flow) override the initial data.
+    host = entry.options.get(CONF_HOST, entry.data[CONF_HOST])
+    port = entry.options.get(CONF_PORT, entry.data[CONF_PORT])
+    secret = entry.options.get(CONF_PASSWORD, entry.data.get(CONF_PASSWORD, ""))
+    use_tls = entry.options.get(CONF_SSL, entry.data.get(CONF_SSL, False))
+    update_interval = int(
+        entry.options.get(
+            CONF_UPDATE_INTERVAL,
+            entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
+        )
+    )
     client = SingBoxClient(
-        host=entry.data[CONF_HOST],
-        port=entry.data[CONF_PORT],
-        secret=entry.data.get(CONF_PASSWORD, ""),
-        use_tls=entry.data.get(CONF_SSL, False),
+        host=host,
+        port=port,
+        secret=secret,
+        use_tls=use_tls,
         session=async_get_clientsession(hass),
     )
-    coordinator = SingBoxCoordinator(hass, entry, client)
+    coordinator = SingBoxCoordinator(
+        hass, entry, client, update_interval_seconds=update_interval
+    )
     try:
         await coordinator.async_setup()
     except GrpcError as err:
@@ -57,7 +75,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await _async_setup_services(hass)
+    # Reload the integration when options (host/port/secret/interval) change.
+    entry.async_on_unload(entry.add_update_listener(_async_update_options))
     return True
+
+
+async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry after its options were updated."""
+    await hass.config_entries.async_reload_entry(entry)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

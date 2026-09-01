@@ -69,6 +69,19 @@ Notes:
 4. Add the integration via **Settings → Devices & Services → Add Integration
    → sing-box** and enter host, port and API secret.
 
+## Configuration
+
+After installation, all settings can be changed anytime from
+**Settings → Devices & Services → sing-box → Configure**:
+
+- **Host / Port / API secret / Use TLS** — connection settings. The
+  integration reconnects automatically after saving.
+- **Status update interval** (1–60 s) — how often sing-box pushes status
+  (memory, connections, traffic). Speed sensors always report B/s regardless
+  of the interval. Use a larger interval to reduce load on busy instances.
+
+The integration reloads automatically when options are saved.
+
 ## Entities
 
 | Entity | Type | Notes |

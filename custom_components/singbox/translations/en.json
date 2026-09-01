@@ -8,7 +8,8 @@
           "host": "Host",
           "port": "Port",
           "password": "API secret",
-          "ssl": "Use TLS (https)"
+          "ssl": "Use TLS (https)",
+          "update_interval": "Status update interval"
         }
       }
     },
@@ -60,6 +61,25 @@
       "clash_mode": {
         "name": "Clash mode"
       }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "sing-box options",
+        "description": "Change the connection settings or the status update interval. The integration reloads automatically after saving.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "password": "API secret",
+          "ssl": "Use TLS (https)",
+          "update_interval": "Status update interval"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the sing-box API. Check the host, port and that the api service is enabled.",
+      "invalid_auth": "Invalid API secret. Check the secret configured in the sing-box api service."
     }
   }
 }
