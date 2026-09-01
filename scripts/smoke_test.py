@@ -1,11 +1,12 @@
-"""End-to-end smoke test for the sing-box gRPC-Web client.
+"""End-to-end smoke test for the sing-box clients.
 
 Usage:
     python3 scripts/smoke_test.py [--host HOST] [--port PORT] [--secret SECRET]
-                                  [--tls]
+                                  [--clash-port PORT] [--tls]
 
-Requires a running sing-box (>= 1.14.0) with the ``api`` service enabled and
-at least one selector outbound group. Exits non-zero on any failure.
+Requires a running sing-box with the ``api`` service (gRPC, >= 1.14.0) on
+--port and, when --clash-port is given, the ``clash_api`` controller on that
+port. Exits non-zero on any failure.
 """
 
 from __future__ import annotations
@@ -20,11 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "custom_components"
 
 from grpc import (  # noqa: E402
     GRPC_STATUS_NOT_FOUND,
+    GRPC_STATUS_UNIMPLEMENTED,
     GRPC_STATUS_UNAUTHENTICATED,
     GrpcError,
     SingBoxClient,
     decode_fields,
 )
+from clash import ClashApiError, ClashClient  # noqa: E402
 
 
 async def check(step: str, condition: bool, detail: str = "") -> None:
@@ -39,6 +42,8 @@ async def run(args: argparse.Namespace) -> None:
         await _run_checks(args, client)
     finally:
         await client.close()
+    if args.clash_port:
+        await _run_clash_checks(args)
 
 
 async def _run_checks(args: argparse.Namespace, client: SingBoxClient) -> None:
@@ -126,10 +131,109 @@ async def _run_checks(args: argparse.Namespace, client: SingBoxClient) -> None:
     print("\nAll smoke checks passed.")
 
 
+async def _run_clash_checks(args: argparse.Namespace) -> None:
+    print("\n-- clash API backend -----------------------------------------")
+
+    # -- gRPC probe against a clash-only port must report UNIMPLEMENTED ----
+    grpc_probe = SingBoxClient(args.host, args.clash_port, args.secret, args.tls)
+    try:
+        await grpc_probe.get_version()
+        raise AssertionError("gRPC GetVersion succeeded on a clash-only port")
+    except GrpcError as err:
+        await check(
+            "grpc->clash fallback detection",
+            err.status == GRPC_STATUS_UNIMPLEMENTED,
+            f"grpc {err.status}",
+        )
+    finally:
+        await grpc_probe.close()
+
+    client = ClashClient(args.host, args.clash_port, args.secret, args.tls)
+    try:
+        # -- static info -----------------------------------------------------
+        version = await client.get_version()
+        await check("clash get_version", version.startswith("1."), version)
+
+        mode_list, current = await client.get_configs()
+        await check(
+            "clash get_configs",
+            mode_list and current in mode_list,
+            f"modes={mode_list}, current={current}",
+        )
+
+        # -- groups ----------------------------------------------------------
+        groups = await client.get_proxies()
+        await check("clash get_proxies", groups, f"{len(groups)} selectable groups")
+        group = groups[0]
+        await check(
+            "clash group items",
+            len(group.items) > 0,
+            f"{group.tag}: [{', '.join(i.tag for i in group.items)}]",
+        )
+
+        # -- select outbound -------------------------------------------------
+        target = group.items[0].tag
+        await client.select_outbound(group.tag, target)
+        refreshed = await client.get_proxies()
+        now = next(g.selected for g in refreshed if g.tag == group.tag)
+        await check("clash select_outbound", now == target, f"{group.tag} -> {now}")
+
+        # -- url test (allowed to fail without internet) ----------------------
+        try:
+            await client.url_test(group.tag)
+            print("  ok: clash url_test")
+        except ClashApiError as err:
+            print(f"  info: clash url_test failed: {err}")
+
+        # -- connections snapshot --------------------------------------------
+        n, memory, upload_total, download_total = await client.get_connections()
+        await check(
+            "clash get_connections",
+            memory > 0,
+            f"n={n}, memory={memory}, up={upload_total}, down={download_total}",
+        )
+
+        # -- traffic stream ---------------------------------------------------
+        frames = []
+        async for up, down in client.traffic_stream():
+            frames.append((up, down))
+            if len(frames) == 2:
+                break
+        await check(
+            "clash traffic_stream",
+            len(frames) == 2 and all(
+                isinstance(up, int) and isinstance(down, int) for up, down in frames
+            ),
+            f"{len(frames)} frames",
+        )
+
+        # -- close all --------------------------------------------------------
+        await client.close_all_connections()
+        print("  ok: clash close_all_connections")
+
+        # -- clash mode -------------------------------------------------------
+        await client.set_clash_mode(mode_list[0])
+        print("  ok: clash set_clash_mode")
+
+        # -- auth -------------------------------------------------------------
+        bad = ClashClient(args.host, args.clash_port, "definitely-wrong")
+        try:
+            await bad.get_version()
+            raise AssertionError("wrong secret was accepted by clash API")
+        except ClashApiError as err:
+            await check("clash auth", err.status == 401, f"http {err.status}")
+        finally:
+            await bad.close()
+    finally:
+        await client.close()
+    print("\nAll clash backend checks passed.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9090)
+    parser.add_argument("--clash-port", type=int, default=9091, help="clash_api port (0 to skip)")
     parser.add_argument("--secret", default="test-secret")
     parser.add_argument("--tls", action="store_true")
     args = parser.parse_args()
@@ -138,7 +242,7 @@ def main() -> int:
     except AssertionError as err:
         print(f"FAILED: {err}")
         return 1
-    except (ConnectionError, GrpcError) as err:
+    except (ConnectionError, GrpcError, ClashApiError) as err:
         print(f"FAILED: {err}")
         return 1
     return 0

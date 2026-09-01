@@ -1,16 +1,24 @@
 # sing-box for Home Assistant
 
 Home Assistant integration that **monitors and controls** a running
-[sing-box](https://sing-box.sagernet.org/) instance through its built-in
-[`api` service](https://sing-box.sagernet.org/configuration/service/api/)
-(sing-box >= 1.14.0). Distributed via [HACS](https://hacs.xyz/).
+[sing-box](https://sing-box.sagernet.org/) instance. Distributed via
+[HACS](https://hacs.xyz/).
 
-The integration talks to sing-box over **gRPC-Web** (plain HTTP, no external
-dependencies), so it works out of the box — no Python packages to install.
+The integration supports **two backends**, auto-detected at setup:
+
+1. the [`api` service](https://sing-box.sagernet.org/configuration/service/api/)
+   (sing-box >= 1.14.0) over **gRPC-Web** — plain HTTP, no external
+   dependencies;
+2. the [`clash_api`](https://sing-box.sagernet.org/configuration/experimental/clash-api/)
+   (Clash REST/WebSocket, any sing-box 1.11+) — used automatically when the
+   gRPC `api` service is not available (e.g. OpenWrt builds that are still on
+   1.13.x).
+
+Either way, no Python packages need to be installed.
 
 ## Features
 
-- **Live monitoring** — sing-box pushes status every second:
+- **Live monitoring**:
   - memory usage, goroutines, active connections
   - uplink / downlink speed
   - uplink / downlink totals (session counters)
@@ -27,11 +35,12 @@ dependencies), so it works out of the box — no Python packages to install.
 ## Requirements
 
 - Home Assistant 2024.6 or newer
-- sing-box 1.14.0 or newer with the `api` service enabled
+- sing-box with either the `api` service (>= 1.14.0) or the `clash_api`
+  controller enabled
 
 ## sing-box configuration
 
-Add an `api` service to your sing-box configuration:
+Add an `api` service to your sing-box configuration (>= 1.14.0):
 
 ```json
 {
@@ -44,6 +53,20 @@ Add an `api` service to your sing-box configuration:
       "secret": "your-secret"
     }
   ]
+}
+```
+
+On older sing-box builds (1.11 – 1.13.x, e.g. some OpenWrt packages) enable
+the `clash_api` controller instead — the integration detects it automatically:
+
+```json
+{
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "your-secret"
+    }
+  }
 }
 ```
 
@@ -86,14 +109,17 @@ The integration reloads automatically when options are saved.
 
 | Entity | Type | Notes |
 |---|---|---|
-| sing-box Version / API version / Started at | sensor | diagnostics |
+| sing-box Version / API version / Started at | sensor | diagnostics; API version & started at are gRPC-only |
 | sing-box Memory | sensor | data size (B) |
-| sing-box Goroutines | sensor | diagnostics |
-| sing-box Connections in / out | sensor | active connections |
+| sing-box Goroutines | sensor | diagnostics; gRPC-only |
+| sing-box Connections in / out | sensor | active connections; on the clash backend "out" is unavailable |
 | sing-box Uplink / Downlink | sensor | speed, B/s |
 | sing-box Uplink total / Downlink total | sensor | session totals |
 | sing-box \<group tag\> | select | one per selector outbound group |
 | sing-box Clash mode | select | only when the clash API is enabled |
+
+On the clash API backend the entities that cannot be provided (goroutines,
+connections out, started at, API version) simply stay unavailable.
 
 ## Services
 
@@ -104,18 +130,19 @@ multiple sing-box instances are configured.
 |---|---|---|
 | `singbox.select_outbound` | `group_tag`, `outbound_tag` | Select an outbound inside a group |
 | `singbox.url_test` | `outbound_tag` | Trigger a URL test for a group |
-| `singbox.set_group_expand` | `group_tag`, `is_expand` | Expand/collapse a group |
+| `singbox.set_group_expand` | `group_tag`, `is_expand` | Expand/collapse a group (gRPC backend only) |
 | `singbox.close_connection` | `connection_id` | Close one connection |
 | `singbox.close_all_connections` | – | Close all connections |
 | `singbox.set_clash_mode` | `mode` | Switch clash mode |
 
 ## Development
 
-Run the end-to-end smoke test against a local sing-box:
+Run the end-to-end smoke test against a local sing-box with both backends:
 
 ```bash
-sing-box run -c /path/to/config.json &
-python3 scripts/smoke_test.py --host 127.0.0.1 --port 9090 --secret your-secret
+sing-box run -c /path/to/config.json &   # gRPC api service
+python3 scripts/smoke_test.py --host 127.0.0.1 --port 9090 \
+    --clash-port 9091 --secret your-secret
 ```
 
 ## Disclaimer

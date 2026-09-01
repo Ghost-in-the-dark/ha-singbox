@@ -1,9 +1,10 @@
 """Data coordinator for the sing-box integration.
 
-Unlike a polling coordinator, sing-box pushes data: SubscribeStatus streams a
-Status message roughly every second, SubscribeGroups pushes on every change.
-The coordinator keeps both streams alive, reconnects with exponential backoff
-on failure and exposes the latest snapshot to the entities.
+sing-box pushes data over its gRPC ``api`` service (SubscribeStatus /
+SubscribeGroups streams); on versions without that service (clash_api only)
+the same data is gathered from the Clash REST/WebSocket API. The coordinator
+keeps the backend streams alive, reconnects with exponential backoff on
+failure and exposes the latest snapshot to the entities.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .clash import ClashApiError, ClashClient, POLL_INTERVAL_SECONDS
 from .const import DEFAULT_UPDATE_INTERVAL, DOMAIN
 from .grpc import (
     GRPC_STATUS_NOT_FOUND,
@@ -29,6 +31,9 @@ from .grpc import (
 
 _LOGGER = logging.getLogger(__package__)
 
+BACKEND_GRPC = "grpc"
+BACKEND_CLASH = "clash"
+
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 60.0
 
@@ -40,13 +45,15 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self,
         hass: HomeAssistant,
         entry: ConfigEntry,
-        client: SingBoxClient,
+        client: SingBoxClient | ClashClient,
+        backend: str,
         update_interval_seconds: int = DEFAULT_UPDATE_INTERVAL,
     ) -> None:
         super().__init__(
             hass, _LOGGER, name=DOMAIN, update_interval=None, config_entry=entry
         )
         self.client = client
+        self.backend = backend
         self.data = SingBoxStatus()
         self._stream_tasks: list[asyncio.Task] = []
         self.clash_mode_available = False
@@ -56,19 +63,30 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self._interval_ns = update_interval_seconds * 1_000_000_000
 
     async def async_setup(self) -> None:
-        """Fetch static info and start the push streams."""
+        """Fetch static info and start the backend streams."""
+        if self.backend == BACKEND_GRPC:
+            await self._setup_grpc()
+        else:
+            await self._setup_clash()
+        # Entities for outbound groups are created at platform setup, so wait
+        # for the first groups snapshot before proceeding.
         try:
-            version, api_version = await self.client.get_version()
+            await asyncio.wait_for(self._groups_ready.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("no groups received from sing-box within 10s")
+
+    async def _setup_grpc(self) -> None:
+        client: SingBoxClient = self.client
+        try:
+            version, api_version = await client.get_version()
             self.data.version = version
             self.data.api_version = api_version
-            self.data.started_at = await self.client.get_started_at()
-        except GrpcError as err:
-            raise err
+            self.data.started_at = await client.get_started_at()
         except (asyncio.TimeoutError, OSError, ConnectionError) as err:
             raise ConnectionError(f"cannot reach sing-box API: {err}") from err
 
         try:
-            mode_list, current = await self.client.get_clash_mode_status()
+            mode_list, current = await client.get_clash_mode_status()
             self.data.clash_mode_list = mode_list
             self.data.clash_mode = current
             self.clash_mode_available = True
@@ -78,18 +96,33 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             self.clash_mode_available = False
 
         self._stream_tasks = [
-            asyncio.create_task(self._run_status_stream()),
+            asyncio.create_task(self._run_grpc_status_stream()),
             asyncio.create_task(self._run_groups_stream()),
         ]
-        # Entities for outbound groups are created at platform setup, so wait
-        # for the first Groups push before proceeding.
+
+    async def _setup_clash(self) -> None:
+        client: ClashClient = self.client
         try:
-            await asyncio.wait_for(self._groups_ready.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            _LOGGER.warning("no groups received from sing-box within 10s")
+            self.data.version = await client.get_version()
+        except (asyncio.TimeoutError, OSError, ConnectionError) as err:
+            raise ConnectionError(f"cannot reach sing-box API: {err}") from err
+
+        try:
+            mode_list, current = await client.get_configs()
+            self.data.clash_mode_list = mode_list
+            self.data.clash_mode = current
+            self.clash_mode_available = True
+        except ClashApiError as err:
+            _LOGGER.warning("clash mode unavailable: %s", err)
+            self.clash_mode_available = False
+
+        self._stream_tasks = [
+            asyncio.create_task(self._run_clash_traffic_stream()),
+            asyncio.create_task(self._run_clash_poll_loop()),
+        ]
 
     async def async_shutdown(self) -> None:
-        """Cancel the push streams."""
+        """Cancel the backend streams."""
         for task in self._stream_tasks:
             task.cancel()
         await asyncio.gather(*self._stream_tasks, return_exceptions=True)
@@ -98,7 +131,7 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
 
     # -- streams ------------------------------------------------------------
 
-    async def _run_status_stream(self) -> None:
+    async def _run_grpc_status_stream(self) -> None:
         backoff = _MIN_BACKOFF
         while True:
             try:
@@ -141,6 +174,66 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _MAX_BACKOFF)
 
+    async def _run_clash_traffic_stream(self) -> None:
+        backoff = _MIN_BACKOFF
+        while True:
+            try:
+                async for up, down in self.client.traffic_stream():
+                    self.data.uplink = up
+                    self.data.downlink = down
+                    backoff = _MIN_BACKOFF
+                    self._mark_available()
+            except asyncio.CancelledError:
+                raise
+            except ClashApiError as err:
+                _LOGGER.error("traffic stream failed: %s", err)
+            except (asyncio.TimeoutError, OSError, ConnectionError) as err:
+                _LOGGER.warning("traffic stream lost: %s", err)
+            self._mark_unavailable(None)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_BACKOFF)
+
+    async def _run_clash_poll_loop(self) -> None:
+        backoff = _MIN_BACKOFF
+        interval = max(self._interval_seconds, POLL_INTERVAL_SECONDS)
+        while True:
+            try:
+                groups = await self.client.get_proxies()
+                self.data.groups = groups
+                self._groups_ready.set()
+                self._apply_clash_mode()
+                self._apply_clash_connections()
+                backoff = _MIN_BACKOFF
+                self._mark_available()
+            except asyncio.CancelledError:
+                raise
+            except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
+                _LOGGER.warning("clash poll failed: %s", err)
+                self._mark_unavailable(None)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+                continue
+            await asyncio.sleep(interval)
+
+    async def _apply_clash_mode(self) -> None:
+        try:
+            mode_list, current = await self.client.get_configs()
+            self.data.clash_mode_list = mode_list
+            self.data.clash_mode = current
+            self.clash_mode_available = True
+        except ClashApiError:
+            pass
+
+    async def _apply_clash_connections(self) -> None:
+        try:
+            n, memory, upload_total, download_total = await self.client.get_connections()
+            self.data.connections_in = n
+            self.data.memory = memory
+            self.data.uplink_total = upload_total
+            self.data.downlink_total = download_total
+        except ClashApiError:
+            pass
+
     def _mark_available(self) -> None:
         if not self.last_update_success:
             self.last_update_success = True
@@ -157,6 +250,31 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
     async def select_outbound(self, group_tag: str, outbound_tag: str) -> None:
         await self.client.select_outbound(group_tag, outbound_tag)
 
+    async def set_group_expand(self, group_tag: str, is_expand: bool) -> None:
+        if self.backend == BACKEND_GRPC:
+            await self.client.set_group_expand(group_tag, is_expand)
+            return
+        raise ClashApiError(
+            0, "set_group_expand is not supported by the clash API"
+        )
+
+    async def url_test(self, outbound_tag: str, url: str | None = None) -> None:
+        await self.client.url_test(outbound_tag, url)
+
+    async def close_connection(self, connection_id: str) -> None:
+        await self.client.close_connection(connection_id)
+
+    async def close_all_connections(self) -> None:
+        await self.client.close_all_connections()
+
+    async def set_clash_mode(self, mode: str) -> None:
+        await self.client.set_clash_mode(mode)
+        self.data.clash_mode = mode
+        self.async_set_updated_data(self.data)
+
+    def group(self, tag: str) -> SingBoxGroup | None:
+        return next((g for g in self.data.groups if g.tag == tag), None)
+
     def _apply_status(self, fields: dict[int, list[int | bytes]]) -> None:
         self.data.memory = _int(fields, 1)
         self.data.goroutines = _int(fields, 2)
@@ -169,23 +287,3 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self.data.downlink = _int(fields, 7) / self._interval_seconds
         self.data.uplink_total = _int(fields, 8)
         self.data.downlink_total = _int(fields, 9)
-
-    async def set_clash_mode(self, mode: str) -> None:
-        await self.client.set_clash_mode(mode)
-        self.data.clash_mode = mode
-        self.async_set_updated_data(self.data)
-
-    async def set_group_expand(self, group_tag: str, is_expand: bool) -> None:
-        await self.client.set_group_expand(group_tag, is_expand)
-
-    async def url_test(self, outbound_tag: str) -> None:
-        await self.client.url_test(outbound_tag)
-
-    async def close_connection(self, connection_id: str) -> None:
-        await self.client.close_connection(connection_id)
-
-    async def close_all_connections(self) -> None:
-        await self.client.close_all_connections()
-
-    def group(self, tag: str) -> SingBoxGroup | None:
-        return next((g for g in self.data.groups if g.tag == tag), None)

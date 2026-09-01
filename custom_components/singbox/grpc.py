@@ -32,6 +32,7 @@ GRPC_WEB_CONTENT_TYPE = "application/grpc-web+proto"
 
 GRPC_STATUS_OK = 0
 GRPC_STATUS_NOT_FOUND = 5
+GRPC_STATUS_UNIMPLEMENTED = 12
 GRPC_STATUS_UNAUTHENTICATED = 16
 
 # The stream of Status messages is pushed every second by default; if no bytes
@@ -310,6 +311,13 @@ class SingBoxClient:
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 body = await resp.read()
+                if resp.status != 200:
+                    # A non-gRPC server (e.g. a clash_api-only sing-box) answers
+                    # 404 for RPC paths without a grpc-status header.
+                    raise GrpcError(
+                        GRPC_STATUS_UNIMPLEMENTED,
+                        f"RPC {method} failed (HTTP {resp.status})",
+                    )
                 status, message = _parse_status_response(resp.headers, body)
         except aiohttp.ClientError as err:
             raise ConnectionError(f"cannot reach sing-box API at {self._base_url}: {err}") from err
