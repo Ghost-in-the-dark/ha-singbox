@@ -171,6 +171,9 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
         # These are config-entry level services, not entity services: do not
         # require an entity/device target (that made calls from the Lovelace
         # card fail with "must contain at least one of entity_id, ...").
+        # ALLOW_EXTRA keeps compatibility with callers that still pass an
+        # entity_id target (e.g. the panel card) — a plain vol.Schema would
+        # reject them with "extra keys not allowed".
         hass.services.async_register(
-            DOMAIN, name, _wrap(handler), schema=vol.Schema(fields)
+            DOMAIN, name, _wrap(handler), schema=vol.Schema(fields, extra=vol.ALLOW_EXTRA)
         )
