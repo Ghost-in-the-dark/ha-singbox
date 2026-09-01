@@ -1,5 +1,7 @@
 # sing-box for Home Assistant
 
+![sing-box](brands/icon.png)
+
 Home Assistant integration that **monitors and controls** a running
 [sing-box](https://sing-box.sagernet.org/) instance. Distributed via
 [HACS](https://hacs.xyz/).
@@ -152,6 +154,38 @@ sing-box run -c /path/to/config.json &   # gRPC api service
 python3 scripts/smoke_test.py --host 127.0.0.1 --port 9090 \
     --clash-port 9091 --secret your-secret
 ```
+
+## Publishing to HACS
+
+This repository is distributed through HACS. The following requirements must
+be met for it to be listed and updated correctly:
+
+- **Public repository** — the repository must be public on GitHub.
+- **Description** — the *About/Description* field in the GitHub repository
+  settings must be filled in; this text is displayed in the HACS UI.
+- **Topics** — relevant tags must be added; they are not visible in the UI but
+  are used by HACS's internal search.
+- **README.md** — must exist and contain installation and configuration
+  instructions.
+- **GitHub Releases** — HACS resolves versions from the tags of published
+  releases (Publish release). Creating a tag alone is not enough; a full
+  release must be published.
+- **hacs.json** — the manifest in the repository root specifies `name`
+  (display name), `filename` (where applicable), and the minimum required Home
+  Assistant (`homeassistant`) and HACS (`hacs`) versions.
+
+Additional requirements depend on the repository type:
+
+- **Integrations** — a `brands` folder with brand assets (at least
+  `icon.png`) is required, and the integration must follow the Home Assistant
+  `custom_components` development standards.
+- **Plugins (Lovelace) / Themes** — files must live in the directories HACS
+  expects (e.g. `/www/community/`); `hacs.json` must correctly set
+  `content_in_root` or `filename`.
+- **Validation (recommended)** — add the [HACS GitHub Action]
+  (https://hacs.xyz/docs/publish/action/) (`.github/workflows/validate.yaml`)
+  to automatically check the repository against the HACS standards on every
+  push and release.
 
 ## Disclaimer
 
