@@ -9,5 +9,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/Ghost-in-the-dark/ha-singbox/issues",
   "requirements": [],
-  "version": "0.3.10"
+  "version": "0.3.11"
 }

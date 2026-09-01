@@ -196,6 +196,12 @@ class ClashClient:
         for name, info in raw.items():
             if not isinstance(info, dict):
                 continue
+            # "GLOBAL" is a synthetic clash-API group (Fallback over all
+            # proxies) that exists in /proxies but has no backing outbound:
+            # /proxies/GLOBAL/delay answers 404 and it can never be selected.
+            # Skip it so no ping sensor is created for it.
+            if name == "GLOBAL":
+                continue
             delay, delay_time = _last_url_test_delay(info, raw)
             proxies.append(
                 SingBoxGroupItem(
