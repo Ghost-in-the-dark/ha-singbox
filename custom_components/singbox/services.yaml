@@ -1,0 +1,113 @@
+select_outbound:
+  name: Select outbound
+  description: >-
+    Select an outbound inside an outbound group (selector). Equivalent to
+    choosing an option in the corresponding select entity.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      example: 01JEXAMPLE
+      selector:
+        text:
+    group_tag:
+      name: Group tag
+      description: Tag of the outbound group to change.
+      required: true
+      example: proxy
+      selector:
+        text:
+    outbound_tag:
+      name: Outbound tag
+      description: Tag of the outbound to select inside the group.
+      required: true
+      example: direct
+      selector:
+        text:
+
+url_test:
+  name: URL test
+  description: Trigger a URL test for an outbound group to refresh delays.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      selector:
+        text:
+    outbound_tag:
+      name: Outbound tag
+      description: Tag of the outbound group to test.
+      required: true
+      example: auto
+      selector:
+        text:
+
+set_group_expand:
+  name: Set group expand
+  description: Expand or collapse an outbound group.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      selector:
+        text:
+    group_tag:
+      name: Group tag
+      description: Tag of the outbound group.
+      required: true
+      selector:
+        text:
+    is_expand:
+      name: Expanded
+      description: Whether the group should be expanded.
+      required: true
+      selector:
+        boolean:
+
+close_connection:
+  name: Close connection
+  description: Close a single active connection by its ID.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      selector:
+        text:
+    connection_id:
+      name: Connection ID
+      description: ID of the connection to close.
+      required: true
+      selector:
+        text:
+
+close_all_connections:
+  name: Close all connections
+  description: Close every active connection.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      selector:
+        text:
+
+set_clash_mode:
+  name: Set clash mode
+  description: Switch the clash mode (requires the clash API to be enabled in sing-box).
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      selector:
+        text:
+    mode:
+      name: Mode
+      description: Clash mode to activate (e.g. rule, global, direct).
+      required: true
+      selector:
+        text:

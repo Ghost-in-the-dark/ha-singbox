@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Подключение к sing-box",
+        "description": "Настройте подключение к API-сервису sing-box. Сервис `api` должен быть включён в конфигурации sing-box (sing-box >= 1.14.0).",
+        "data": {
+          "host": "Хост",
+          "port": "Порт",
+          "password": "Секрет API",
+          "ssl": "Использовать TLS (https)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Не удалось подключиться к API sing-box. Проверьте хост, порт и что сервис api включён.",
+      "invalid_auth": "Неверный секрет API. Проверьте секрет, заданный в сервисе api в конфигурации sing-box."
+    },
+    "abort": {
+      "already_configured": "Этот экземпляр sing-box уже настроен."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "version": {
+        "name": "Версия"
+      },
+      "api_version": {
+        "name": "Версия API"
+      },
+      "started_at": {
+        "name": "Время запуска"
+      },
+      "memory": {
+        "name": "Память"
+      },
+      "goroutines": {
+        "name": "Горутины"
+      },
+      "connections_in": {
+        "name": "Входящие соединения"
+      },
+      "connections_out": {
+        "name": "Исходящие соединения"
+      },
+      "uplink": {
+        "name": "Скорость загрузки"
+      },
+      "downlink": {
+        "name": "Скорость скачивания"
+      },
+      "uplink_total": {
+        "name": "Загружено всего"
+      },
+      "downlink_total": {
+        "name": "Скачано всего"
+      }
+    },
+    "select": {
+      "clash_mode": {
+        "name": "Clash режим"
+      }
+    }
+  }
+}

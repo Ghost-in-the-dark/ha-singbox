@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to sing-box",
+        "description": "Configure the connection to the sing-box API service. The `api` service must be enabled in your sing-box config (sing-box >= 1.14.0).",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "password": "API secret",
+          "ssl": "Use TLS (https)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the sing-box API. Check the host, port and that the api service is enabled.",
+      "invalid_auth": "Invalid API secret. Check the secret configured in the sing-box api service."
+    },
+    "abort": {
+      "already_configured": "This sing-box instance is already configured."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "version": {
+        "name": "Version"
+      },
+      "api_version": {
+        "name": "API version"
+      },
+      "started_at": {
+        "name": "Started at"
+      },
+      "memory": {
+        "name": "Memory"
+      },
+      "goroutines": {
+        "name": "Goroutines"
+      },
+      "connections_in": {
+        "name": "Connections in"
+      },
+      "connections_out": {
+        "name": "Connections out"
+      },
+      "uplink": {
+        "name": "Uplink"
+      },
+      "downlink": {
+        "name": "Downlink"
+      },
+      "uplink_total": {
+        "name": "Uplink total"
+      },
+      "downlink_total": {
+        "name": "Downlink total"
+      }
+    },
+    "select": {
+      "clash_mode": {
+        "name": "Clash mode"
+      }
+    }
+  }
+}
