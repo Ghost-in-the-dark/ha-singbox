@@ -32,10 +32,13 @@ from homeassistant.helpers.selector import (
 from .backend import detect_backend
 from .clash import ClashApiError
 from .const import (
+    CONF_SPEED_UNIT,
     CONF_UPDATE_INTERVAL,
     DEFAULT_PORT,
+    DEFAULT_SPEED_UNIT,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
+    SPEED_UNIT_OPTIONS,
     UPDATE_INTERVAL_OPTIONS,
 )
 from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
@@ -63,6 +66,14 @@ CONNECTION_SCHEMA = vol.Schema(
                 mode=SelectSelectorMode.DROPDOWN,
             )
         ),
+        vol.Required(CONF_SPEED_UNIT): SelectSelector(
+            SelectSelectorConfig(
+                options=[
+                    {"label": unit, "value": unit} for unit in SPEED_UNIT_OPTIONS
+                ],
+                mode=SelectSelectorMode.DROPDOWN,
+            )
+        ),
     }
 )
 
@@ -75,6 +86,7 @@ def _default_values(user_input: dict[str, Any] | None) -> dict[str, Any]:
         CONF_PASSWORD: "",
         CONF_SSL: False,
         CONF_UPDATE_INTERVAL: str(DEFAULT_UPDATE_INTERVAL),
+        CONF_SPEED_UNIT: DEFAULT_SPEED_UNIT,
     }
 
 
@@ -88,6 +100,10 @@ def _current_values(config_entry: ConfigEntry) -> dict[str, Any]:
                 CONF_UPDATE_INTERVAL,
                 config_entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
             )
+        ),
+        CONF_SPEED_UNIT: config_entry.options.get(
+            CONF_SPEED_UNIT,
+            config_entry.data.get(CONF_SPEED_UNIT, DEFAULT_SPEED_UNIT),
         ),
     }
 

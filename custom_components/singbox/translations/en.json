@@ -9,7 +9,8 @@
           "port": "Port",
           "password": "API secret",
           "ssl": "Use TLS (https)",
-          "update_interval": "Status update interval"
+          "update_interval": "Status update interval",
+          "speed_unit": "Speed unit"
         }
       }
     },
@@ -67,13 +68,14 @@
     "step": {
       "init": {
         "title": "sing-box options",
-        "description": "Change the connection settings or the status update interval. The integration reloads automatically after saving.",
+        "description": "Change the connection settings, the status update interval or the speed unit. The integration reloads automatically after saving.",
         "data": {
           "host": "Host",
           "port": "Port",
           "password": "API secret",
           "ssl": "Use TLS (https)",
-          "update_interval": "Status update interval"
+          "update_interval": "Status update interval",
+          "speed_unit": "Speed unit"
         }
       }
     },

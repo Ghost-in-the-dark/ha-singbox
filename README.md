@@ -100,8 +100,11 @@ After installation, all settings can be changed anytime from
 - **Host / Port / API secret / Use TLS** — connection settings. The
   integration reconnects automatically after saving.
 - **Status update interval** (1–60 s) — how often sing-box pushes status
-  (memory, connections, traffic). Speed sensors always report B/s regardless
-  of the interval. Use a larger interval to reduce load on busy instances.
+  (memory, connections, traffic). Use a larger interval to reduce load on
+  busy instances.
+- **Speed unit** (B/s, KiB/s, kB/s, MiB/s, MB/s) — display unit for the
+  uplink/downlink speed sensors. The raw value is always B/s; the sensor
+  scales it to the chosen unit.
 
 The integration reloads automatically when options are saved.
 
@@ -113,7 +116,7 @@ The integration reloads automatically when options are saved.
 | sing-box Memory | sensor | data size (B) |
 | sing-box Goroutines | sensor | diagnostics; gRPC-only |
 | sing-box Connections in / out | sensor | active connections; on the clash backend "out" is unavailable |
-| sing-box Uplink / Downlink | sensor | speed, B/s |
+| sing-box Uplink / Downlink | sensor | speed, configurable unit (B/s, KiB/s, kB/s, MiB/s, MB/s) |
 | sing-box Uplink total / Downlink total | sensor | session totals |
 | sing-box \<group tag\> | select | one per selector outbound group |
 | sing-box Clash mode | select | only when the clash API is enabled |

@@ -21,7 +21,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, MANUFACTURER
+from .const import CONF_SPEED_UNIT, DEFAULT_SPEED_UNIT, DOMAIN, MANUFACTURER, SPEED_UNIT_FACTORS
 from .coordinator import SingBoxCoordinator
 
 SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
@@ -142,12 +142,23 @@ class SingBoxSensor(CoordinatorEntity[SingBoxCoordinator], SensorEntity):
             manufacturer=MANUFACTURER,
             model=coordinator.data.version,
         )
+        if description.key in ("uplink", "downlink"):
+            unit = coordinator.config_entry.options.get(
+                CONF_SPEED_UNIT,
+                coordinator.config_entry.data.get(CONF_SPEED_UNIT, DEFAULT_SPEED_UNIT),
+            )
+            self._attr_native_unit_of_measurement = unit
+            self._speed_factor: float | None = SPEED_UNIT_FACTORS.get(unit, 1.0)
+        else:
+            self._speed_factor = None
 
     @property
     def native_value(self) -> object:
         value = getattr(self.coordinator.data, self._attr)
         if self._attr == "started_at" and value:
             return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        if self._speed_factor is not None and value is not None:
+            return round(value * self._speed_factor, 2)
         return value
 
     @property
