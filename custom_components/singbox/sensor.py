@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     EntityCategory,
-    SensorDeviceClass,
-    SensorStateClass,
     UnitOfDataRate,
     UnitOfInformation,
 )
