@@ -131,6 +131,13 @@ Ping sensors report the last delay sing-box itself measured during a url-test
 (group auto-tests on their configured interval, or via the `singbox.url_test`
 service) — the integration never probes the network on its own.
 
+## Companion card
+
+Turn these entities into a ready-made dashboard with the
+[Sing-box Panel Card](https://github.com/Ghost-in-the-dark/ha-singbox-panel)
+— a Lovelace card (installable via HACS) showing live speeds, traffic totals,
+per-proxy pings and one-click proxy switching.
+
 ## Services
 
 All services take an optional `entry_id` field; it is only required when
