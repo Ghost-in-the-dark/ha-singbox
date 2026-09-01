@@ -201,8 +201,8 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
                 groups = await self.client.get_proxies()
                 self.data.groups = groups
                 self._groups_ready.set()
-                self._apply_clash_mode()
-                self._apply_clash_connections()
+                await self._apply_clash_mode()
+                await self._apply_clash_connections()
                 backoff = _MIN_BACKOFF
                 self._mark_available()
             except asyncio.CancelledError:

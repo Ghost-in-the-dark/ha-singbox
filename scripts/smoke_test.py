@@ -25,6 +25,62 @@ _pkg = types.ModuleType("singbox")
 _pkg.__path__ = [str(_PKG_DIR)]
 sys.modules["singbox"] = _pkg
 
+
+def _stub_homeassistant() -> None:
+    """Register a minimal fake homeassistant so coordinator.py can be imported."""
+    ha = types.ModuleType("homeassistant")
+    ha.__path__ = []
+    sys.modules["homeassistant"] = ha
+
+    config_entries = types.ModuleType("homeassistant.config_entries")
+    config_entries.ConfigEntry = object
+    sys.modules["homeassistant.config_entries"] = config_entries
+
+    core = types.ModuleType("homeassistant.core")
+    core.HomeAssistant = object
+    sys.modules["homeassistant.core"] = core
+
+    const = types.ModuleType("homeassistant.const")
+
+    class Platform:
+        SENSOR = "sensor"
+        SELECT = "select"
+
+    const.Platform = Platform
+    sys.modules["homeassistant.const"] = const
+
+    helpers = types.ModuleType("homeassistant.helpers")
+    helpers.__path__ = []
+    sys.modules["homeassistant.helpers"] = helpers
+
+    update_coordinator = types.ModuleType("homeassistant.helpers.update_coordinator")
+
+    class DataUpdateCoordinator:
+        def __class_getitem__(cls, item):  # support DataUpdateCoordinator[T]
+            return cls
+
+        def __init__(
+            self, hass, logger, *, name, update_interval, config_entry=None
+        ) -> None:
+            self.hass = hass
+            self.logger = logger
+            self.name = name
+            self.config_entry = config_entry
+            self.last_update_success = True
+            self.data = None
+
+        def async_set_updated_data(self, data) -> None:
+            self.data = data
+
+        def async_update_listeners(self) -> None:
+            pass
+
+    update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
+    sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
+
+
+_stub_homeassistant()
+
 from singbox.backend import BACKEND_CLASH, BACKEND_GRPC, detect_backend  # noqa: E402
 from singbox.clash import ClashApiError, ClashClient  # noqa: E402
 from singbox.grpc import (  # noqa: E402
@@ -64,6 +120,7 @@ async def run(args: argparse.Namespace) -> None:
         await client.close()
     if args.clash_port:
         await _run_clash_checks(args)
+        await _run_coordinator_clash_checks(args)
 
 
 async def _run_checks(args: argparse.Namespace, client: SingBoxClient) -> None:
@@ -247,6 +304,49 @@ async def _run_clash_checks(args: argparse.Namespace) -> None:
     finally:
         await client.close()
     print("\nAll clash backend checks passed.")
+
+
+async def _run_coordinator_clash_checks(args: argparse.Namespace) -> None:
+    """Exercise the coordinator's clash poll loop against the live API.
+
+    Regression guard: _apply_clash_mode/_apply_clash_connections were once
+    called without await inside the poll loop, leaving every counter sensor
+    permanently unavailable while the rest of the integration looked healthy.
+    """
+    from singbox.coordinator import SingBoxCoordinator  # noqa: E402
+
+    client = ClashClient(args.host, args.clash_port, args.secret, args.tls)
+    entry = types.SimpleNamespace(entry_id="test-entry")
+    coordinator = SingBoxCoordinator(
+        None, entry, client, BACKEND_CLASH, update_interval_seconds=1
+    )
+    task = asyncio.create_task(coordinator._run_clash_poll_loop())
+    try:
+        await asyncio.wait_for(coordinator._groups_ready.wait(), timeout=10)
+        # The poll loop applies the clash mode and the connections snapshot
+        # right after publishing the groups; give it a moment.
+        for _ in range(50):
+            if coordinator.data.memory is not None:
+                break
+            await asyncio.sleep(0.1)
+        await check(
+            "coordinator clash poll loop sets counters",
+            coordinator.data.memory is not None
+            and coordinator.data.connections_in is not None
+            and coordinator.data.uplink_total is not None
+            and coordinator.data.downlink_total is not None,
+            f"memory={coordinator.data.memory}, conns={coordinator.data.connections_in}, "
+            f"up={coordinator.data.uplink_total}, down={coordinator.data.downlink_total}",
+        )
+        await check(
+            "coordinator clash mode",
+            coordinator.clash_mode_available,
+            f"mode={coordinator.data.clash_mode}",
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.close()
 
 
 def main() -> int:
