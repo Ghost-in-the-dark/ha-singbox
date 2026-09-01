@@ -183,10 +183,12 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
                     self._mark_available()
             except asyncio.CancelledError:
                 raise
-            except ClashApiError as err:
+            except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
                 _LOGGER.error("traffic stream failed: %s", err)
-            except (asyncio.TimeoutError, OSError, ConnectionError) as err:
-                _LOGGER.warning("traffic stream lost: %s", err)
+            except (ValueError, TypeError) as err:
+                _LOGGER.error("traffic stream returned a malformed frame: %s", err)
+            except Exception as err:  # noqa: BLE001 - keep the stream alive
+                _LOGGER.exception("traffic stream crashed: %s", err)
             self._mark_unavailable(None)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _MAX_BACKOFF)
@@ -211,26 +213,40 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, _MAX_BACKOFF)
                 continue
+            except (ValueError, TypeError) as err:
+                _LOGGER.error("clash poll returned a malformed response: %s", err)
+                self._mark_unavailable(None)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+                continue
+            except Exception as err:  # noqa: BLE001 - keep the loop alive
+                _LOGGER.exception("clash poll loop crashed: %s", err)
+                self._mark_unavailable(None)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+                continue
             await asyncio.sleep(interval)
 
     async def _apply_clash_mode(self) -> None:
         try:
             mode_list, current = await self.client.get_configs()
-            self.data.clash_mode_list = mode_list
-            self.data.clash_mode = current
-            self.clash_mode_available = True
-        except ClashApiError:
-            pass
+        except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
+            _LOGGER.warning("clash mode poll failed: %s", err)
+            return
+        self.data.clash_mode_list = mode_list
+        self.data.clash_mode = current
+        self.clash_mode_available = True
 
     async def _apply_clash_connections(self) -> None:
         try:
             n, memory, upload_total, download_total = await self.client.get_connections()
-            self.data.connections_in = n
-            self.data.memory = memory
-            self.data.uplink_total = upload_total
-            self.data.downlink_total = download_total
-        except ClashApiError:
-            pass
+        except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
+            _LOGGER.warning("clash connections snapshot failed: %s", err)
+            return
+        self.data.connections_in = n
+        self.data.memory = memory
+        self.data.uplink_total = upload_total
+        self.data.downlink_total = download_total
 
     def _mark_available(self) -> None:
         if not self.last_update_success:

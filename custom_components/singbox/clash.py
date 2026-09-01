@@ -84,7 +84,12 @@ class ClashClient:
 
     async def close(self) -> None:
         for ws in self._ws:
-            await ws.close()
+            try:
+                # sing-box's ws server never answers the close handshake, so
+                # bound the wait or shutdown would stall for seconds.
+                await asyncio.wait_for(ws.close(), timeout=2)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                pass
         self._ws.clear()
         if self._own_session and self._session is not None:
             await self._session.close()
@@ -120,12 +125,19 @@ class ClashClient:
         if status >= 400:
             message = body.decode(errors="replace").strip()[:200]
             raise ClashApiError(status, message)
-        return json.loads(body) if body else None
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except ValueError as err:
+            raise ClashApiError(status, f"invalid JSON response: {err}") from err
 
     # -- static info ---------------------------------------------------------
 
     async def get_version(self) -> str:
         data = await self._json("GET", "/version")
+        if not isinstance(data, dict):
+            raise ClashApiError(200, f"unexpected /version response: {type(data).__name__}")
         version = data.get("version", "")
         # "sing-box 1.14.0" -> "1.14.0" to match the gRPC GetVersion response.
         if version.startswith("sing-box "):
@@ -135,14 +147,18 @@ class ClashClient:
     async def get_configs(self) -> tuple[list[str], str]:
         """Return (mode_list, current_mode)."""
         data = await self._json("GET", "/configs")
+        if not isinstance(data, dict):
+            raise ClashApiError(200, f"unexpected /configs response: {type(data).__name__}")
         return data.get("mode-list", []), data.get("mode", "")
 
     async def get_proxies(self) -> list[SingBoxGroup]:
         """Return the selectable (Selector) outbound groups."""
         data = await self._json("GET", "/proxies")
+        if not isinstance(data, dict):
+            raise ClashApiError(200, f"unexpected /proxies response: {type(data).__name__}")
         groups: list[SingBoxGroup] = []
         for name, info in data.get("proxies", {}).items():
-            if info.get("type") != "Selector" or "all" not in info:
+            if not isinstance(info, dict) or info.get("type") != "Selector" or "all" not in info:
                 continue
             items = [
                 SingBoxGroupItem(tag=tag, type="", url_test_time=0, url_test_delay=0)
@@ -163,8 +179,11 @@ class ClashClient:
     async def get_connections(self) -> tuple[int, int, int, int]:
         """Return (active_connections, memory, upload_total, download_total)."""
         data = await self._json("GET", "/connections/")
+        if not isinstance(data, dict):
+            raise ClashApiError(200, f"unexpected /connections response: {type(data).__name__}")
+        connections = data.get("connections", [])
         return (
-            len(data.get("connections", [])),
+            len(connections) if isinstance(connections, list) else 0,
             data.get("memory", 0),
             data.get("uploadTotal", 0),
             data.get("downloadTotal", 0),
@@ -222,7 +241,15 @@ class ClashClient:
                     raise ConnectionError(f"traffic stream closed: {msg.type}")
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
-                data = json.loads(msg.data)
+                try:
+                    data = json.loads(msg.data)
+                except ValueError as err:
+                    raise ClashApiError(200, f"invalid traffic frame: {err}") from err
                 yield int(data.get("up", 0)), int(data.get("down", 0))
         finally:
-            await ws.close()
+            if ws in self._ws:
+                self._ws.remove(ws)
+            try:
+                await asyncio.wait_for(ws.close(), timeout=2)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                pass
