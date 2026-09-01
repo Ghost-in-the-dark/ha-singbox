@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 
+import voluptuous as vol
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL
 from homeassistant.core import HomeAssistant, ServiceCall
@@ -166,6 +168,9 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
         "set_clash_mode": (_set_clash_mode, {"mode": cv.string}),
     }
     for name, (handler, fields) in services.items():
+        # These are config-entry level services, not entity services: do not
+        # require an entity/device target (that made calls from the Lovelace
+        # card fail with "must contain at least one of entity_id, ...").
         hass.services.async_register(
-            DOMAIN, name, _wrap(handler), schema=cv.make_entity_service_schema(fields)
+            DOMAIN, name, _wrap(handler), schema=vol.Schema(fields)
         )
