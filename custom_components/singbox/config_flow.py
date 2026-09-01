@@ -96,7 +96,7 @@ async def _validate_connection(user_input: dict[str, Any]) -> dict[str, str]:
     try:
         client, _backend = await detect_backend(
             host=user_input[CONF_HOST],
-            port=user_input[CONF_PORT],
+            port=int(user_input[CONF_PORT]),
             secret=user_input.get(CONF_PASSWORD, ""),
             use_tls=user_input.get(CONF_SSL, False),
             session=None,
@@ -122,6 +122,8 @@ def _normalize(user_input: dict[str, Any]) -> dict[str, Any]:
     """Coerce flow input into stored config entry values."""
     return {
         **user_input,
+        # NumberSelector yields floats; ports must stay integers.
+        CONF_PORT: int(user_input[CONF_PORT]),
         CONF_UPDATE_INTERVAL: int(user_input[CONF_UPDATE_INTERVAL]),
     }
 
@@ -139,7 +141,7 @@ class SingBoxConfigFlow(ConfigFlow, domain=DOMAIN):
             errors = await _validate_connection(user_input)
             if not errors:
                 await self.async_set_unique_id(
-                    f"{user_input[CONF_HOST]}:{user_input[CONF_PORT]}"
+                    f"{user_input[CONF_HOST]}:{int(user_input[CONF_PORT])}"
                 )
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(

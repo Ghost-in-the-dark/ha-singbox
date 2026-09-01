@@ -46,7 +46,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a sing-box config entry."""
     # Options (set via the options flow) override the initial data.
     host = entry.options.get(CONF_HOST, entry.data[CONF_HOST])
-    port = entry.options.get(CONF_PORT, entry.data[CONF_PORT])
+    port = int(entry.options.get(CONF_PORT, entry.data[CONF_PORT]))
     secret = entry.options.get(CONF_PASSWORD, entry.data.get(CONF_PASSWORD, ""))
     use_tls = entry.options.get(CONF_SSL, entry.data.get(CONF_SSL, False))
     update_interval = int(

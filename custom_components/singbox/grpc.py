@@ -273,7 +273,7 @@ class SingBoxClient:
         session: aiohttp.ClientSession | None = None,
     ) -> None:
         scheme = "https" if use_tls else "http"
-        self._base_url = f"{scheme}://{host}:{port}"
+        self._base_url = f"{scheme}://{host}:{int(port)}"
         self._secret = secret
         self._session = session
         self._own_session = session is None
