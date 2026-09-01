@@ -26,8 +26,13 @@ async def main(args: argparse.Namespace) -> None:
 
     print("get_version:", await client.get_version())
     print("get_configs:", await client.get_configs())
-    proxies = await client.get_proxies()
-    print("get_proxies:", [(g.tag, g.selectable, g.selected, [i.tag for i in g.items]) for g in proxies])
+    groups, proxies = await client.get_proxies()
+    print("get_proxies (groups):", [(g.tag, g.selectable, g.selected, [i.tag for i in g.items]) for g in groups])
+    print(
+        "get_proxies (pings):",
+        [(p.tag, p.type, p.url_test_delay) for p in proxies if p.url_test_delay > 0]
+        or "no delays yet",
+    )
     print("get_connections:", await client.get_connections())
 
     async def drain(name: str, n: int = 2, timeout: float = 10.0) -> None:

@@ -118,11 +118,16 @@ The integration reloads automatically when options are saved.
 | sing-box Connections in / out | sensor | active connections; on the clash backend "out" is unavailable |
 | sing-box Uplink / Downlink | sensor | speed, configurable unit (B/s, KiB/s, kB/s, MiB/s, MB/s) |
 | sing-box Uplink total / Downlink total | sensor | session totals |
+| sing-box \<proxy tag\> Ping | sensor | last url-test delay (ms) of each proxy; updates whenever sing-box runs a url-test |
 | sing-box \<group tag\> | select | one per selector outbound group |
 | sing-box Clash mode | select | only when the clash API is enabled |
 
 On the clash API backend the entities that cannot be provided (goroutines,
 connections out, started at, API version) simply stay unavailable.
+
+Ping sensors report the last delay sing-box itself measured during a url-test
+(group auto-tests on their configured interval, or via the `singbox.url_test`
+service) — the integration never probes the network on its own.
 
 ## Services
 

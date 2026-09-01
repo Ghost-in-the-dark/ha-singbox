@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -15,6 +16,7 @@ from homeassistant.const import (
     EntityCategory,
     UnitOfDataRate,
     UnitOfInformation,
+    UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
@@ -23,6 +25,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_SPEED_UNIT, DEFAULT_SPEED_UNIT, DOMAIN, MANUFACTURER, SPEED_UNIT_FACTORS
 from .coordinator import SingBoxCoordinator
+from .grpc import SingBoxGroupItem
 
 SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
@@ -169,6 +172,55 @@ class SingBoxSensor(CoordinatorEntity[SingBoxCoordinator], SensorEntity):
         )
 
 
+class SingBoxPingSensor(CoordinatorEntity[SingBoxCoordinator], SensorEntity):
+    """Sensor showing the last url-test delay (ping) of a single proxy."""
+
+    def __init__(self, coordinator: SingBoxCoordinator, tag: str) -> None:
+        super().__init__(coordinator)
+        self._tag = tag
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_ping_{tag}"
+        self._attr_has_entity_name = True
+        self._attr_name = tag
+        self._attr_device_class = SensorDeviceClass.DURATION
+        self._attr_native_unit_of_measurement = UnitOfTime.MILLISECONDS
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_icon = "mdi:heart-pulse"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, coordinator.config_entry.entry_id)},
+            name="sing-box",
+            manufacturer=MANUFACTURER,
+            model=coordinator.data.version,
+        )
+
+    @property
+    def proxy(self) -> SingBoxGroupItem | None:
+        return next(
+            (p for p in self.coordinator.data.proxies if p.tag == self._tag), None
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        proxy = self.proxy
+        if proxy is None or proxy.url_test_delay <= 0:
+            return None
+        return proxy.url_test_delay
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        proxy = self.proxy
+        if proxy is None or proxy.url_test_time <= 0:
+            return {}
+        return {
+            "last_checked": datetime.fromtimestamp(
+                proxy.url_test_time / 1000, tz=timezone.utc
+            ).isoformat()
+        }
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.proxy is not None
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -178,4 +230,10 @@ async def async_setup_entry(
     async_add_entities(
         SingBoxSensor(coordinator, description, _SENSOR_ATTRS[description.key])
         for description in SENSOR_DESCRIPTIONS
+    )
+    # One ping sensor per proxy known at setup time (group members on gRPC,
+    # every /proxies entry on the clash API).
+    async_add_entities(
+        SingBoxPingSensor(coordinator, proxy.tag)
+        for proxy in coordinator.data.proxies
     )

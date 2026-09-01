@@ -201,6 +201,9 @@ class SingBoxStatus:
     uplink_total: int | None = None
     downlink_total: int | None = None
     groups: list[SingBoxGroup] = field(default_factory=list)
+    # Flat, de-duplicated list of all known proxies (group members) with the
+    # last url-test delay known to sing-box.
+    proxies: list[SingBoxGroupItem] = field(default_factory=list)
     clash_mode_list: list[str] | None = None
     clash_mode: str | None = None
 
@@ -441,3 +444,22 @@ def _parse_groups(payload: bytes) -> list[SingBoxGroup]:
             )
         )
     return groups
+
+
+def flatten_proxies(groups: list[SingBoxGroup]) -> list[SingBoxGroupItem]:
+    """Merge group members into a flat, de-duplicated proxy list.
+
+    A proxy can appear in several groups; keep the entry with the freshest
+    url-test result, preferring a known delay over an empty one.
+    """
+    merged: dict[str, SingBoxGroupItem] = {}
+    for group in groups:
+        for item in group.items:
+            prev = merged.get(item.tag)
+            if prev is None:
+                merged[item.tag] = item
+            elif prev.url_test_delay == 0 and item.url_test_delay > 0:
+                merged[item.tag] = item
+            elif item.url_test_time > prev.url_test_time:
+                merged[item.tag] = item
+    return list(merged.values())

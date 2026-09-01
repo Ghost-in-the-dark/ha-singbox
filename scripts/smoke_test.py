@@ -90,6 +90,7 @@ from singbox.grpc import (  # noqa: E402
     GrpcError,
     SingBoxClient,
     decode_fields,
+    flatten_proxies,
 )
 
 
@@ -163,6 +164,12 @@ async def _run_checks(args: argparse.Namespace, client: SingBoxClient) -> None:
     await check("selectable groups", selectable, ", ".join(g.tag for g in selectable))
     group = selectable[0]
     await check("group items", len(group.items) > 0, f"{group.tag}: [{', '.join(i.tag for i in group.items)}]")
+    proxies = flatten_proxies(groups)
+    await check(
+        "grpc proxies flattened",
+        len(proxies) > 0 and len({p.tag for p in proxies}) == len(proxies),
+        f"{len(proxies)} unique proxies",
+    )
 
     # -- control: select an outbound and verify it sticks --------------------
     target = group.items[0].tag
@@ -239,7 +246,7 @@ async def _run_clash_checks(args: argparse.Namespace) -> None:
         )
 
         # -- groups ----------------------------------------------------------
-        groups = await client.get_proxies()
+        groups, proxies = await client.get_proxies()
         await check("clash get_proxies", groups, f"{len(groups)} selectable groups")
         group = groups[0]
         await check(
@@ -247,11 +254,21 @@ async def _run_clash_checks(args: argparse.Namespace) -> None:
             len(group.items) > 0,
             f"{group.tag}: [{', '.join(i.tag for i in group.items)}]",
         )
+        await check(
+            "clash proxies parsed",
+            len(proxies) > len(groups) and all(p.tag for p in proxies),
+            f"{len(proxies)} proxies",
+        )
+        known_delays = [p.url_test_delay for p in proxies if p.url_test_delay > 0]
+        print(
+            f"  info: {len(known_delays)}/{len(proxies)} proxies have a known delay "
+            f"(history may be empty until a url-test runs)"
+        )
 
         # -- select outbound -------------------------------------------------
         target = group.items[0].tag
         await client.select_outbound(group.tag, target)
-        refreshed = await client.get_proxies()
+        refreshed, _ = await client.get_proxies()
         now = next(g.selected for g in refreshed if g.tag == group.tag)
         await check("clash select_outbound", now == target, f"{group.tag} -> {now}")
 
@@ -342,6 +359,11 @@ async def _run_coordinator_clash_checks(args: argparse.Namespace) -> None:
             "coordinator clash mode",
             coordinator.clash_mode_available,
             f"mode={coordinator.data.clash_mode}",
+        )
+        await check(
+            "coordinator clash proxies",
+            len(coordinator.data.proxies) > 0,
+            f"{len(coordinator.data.proxies)} proxies",
         )
     finally:
         task.cancel()

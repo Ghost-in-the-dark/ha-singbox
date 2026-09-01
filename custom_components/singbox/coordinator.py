@@ -28,6 +28,7 @@ from .grpc import (
     SingBoxStatus,
     _bool,
     _int,
+    flatten_proxies,
 )
 
 _LOGGER = logging.getLogger(__package__)
@@ -156,6 +157,7 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             try:
                 async for groups in self.client.subscribe_groups():
                     self.data.groups = groups
+                    self.data.proxies = flatten_proxies(groups)
                     self._groups_ready.set()
                     backoff = _MIN_BACKOFF
                     self._mark_available()
@@ -198,8 +200,9 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         interval = max(self._interval_seconds, POLL_INTERVAL_SECONDS)
         while True:
             try:
-                groups = await self.client.get_proxies()
+                groups, proxies = await self.client.get_proxies()
                 self.data.groups = groups
+                self.data.proxies = proxies
                 self._groups_ready.set()
                 await self._apply_clash_mode()
                 await self._apply_clash_connections()

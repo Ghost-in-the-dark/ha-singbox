@@ -45,6 +45,31 @@ _WS_IDLE_TIMEOUT = 45.0
 POLL_INTERVAL_SECONDS = 5
 
 
+def _last_url_test_delay(info: dict, all_proxies: dict) -> tuple[int, int]:
+    """Return (delay_ms, time_ms) of the newest history entry of a proxy.
+
+    Falls back to the currently selected proxy for groups whose own history
+    is empty (Selector groups never record one; UrlTest groups do).
+    """
+    history = info.get("history")
+    if isinstance(history, list):
+        for entry in reversed(history):
+            if not isinstance(entry, dict):
+                continue
+            delay = entry.get("delay")
+            if isinstance(delay, int) and delay > 0:
+                tested_at = entry.get("time")
+                return delay, tested_at if isinstance(tested_at, int) else 0
+    now = info.get("now")
+    if isinstance(now, str):
+        target = all_proxies.get(now)
+        if isinstance(target, dict) and target is not info:
+            delay, tested_at = _last_url_test_delay(target, all_proxies)
+            if delay:
+                return delay, tested_at
+    return 0, 0
+
+
 class ClashApiError(Exception):
     """A clash API call failed with a non-success status."""
 
@@ -151,30 +176,55 @@ class ClashClient:
             raise ClashApiError(200, f"unexpected /configs response: {type(data).__name__}")
         return data.get("mode-list", []), data.get("mode", "")
 
-    async def get_proxies(self) -> list[SingBoxGroup]:
-        """Return the selectable (Selector) outbound groups."""
+    async def get_proxies(self) -> tuple[list[SingBoxGroup], list[SingBoxGroupItem]]:
+        """Return (selectable groups, flat proxy list with last-known delays).
+
+        Each entry of ``/proxies`` carries a ``history`` array whose newest
+        element holds the last url-test delay (ms) sing-box measured for it.
+        Selector/UrlTest groups with an empty history report the delay of
+        their currently selected proxy instead.
+        """
         data = await self._json("GET", "/proxies")
         if not isinstance(data, dict):
             raise ClashApiError(200, f"unexpected /proxies response: {type(data).__name__}")
+        raw = data.get("proxies", {})
+        if not isinstance(raw, dict):
+            raise ClashApiError(200, "unexpected /proxies.proxies: not an object")
+
         groups: list[SingBoxGroup] = []
-        for name, info in data.get("proxies", {}).items():
-            if not isinstance(info, dict) or info.get("type") != "Selector" or "all" not in info:
+        proxies: list[SingBoxGroupItem] = []
+        for name, info in raw.items():
+            if not isinstance(info, dict):
                 continue
-            items = [
-                SingBoxGroupItem(tag=tag, type="", url_test_time=0, url_test_delay=0)
-                for tag in info["all"]
-            ]
-            groups.append(
-                SingBoxGroup(
+            delay, delay_time = _last_url_test_delay(info, raw)
+            proxies.append(
+                SingBoxGroupItem(
                     tag=name,
                     type=info.get("type", ""),
-                    selectable=True,
-                    selected=info.get("now", ""),
-                    is_expand=False,
-                    items=items,
+                    url_test_time=delay_time,
+                    url_test_delay=delay,
                 )
             )
-        return groups
+            if (
+                info.get("type") == "Selector"
+                and isinstance(info.get("all"), list)
+            ):
+                items = [
+                    SingBoxGroupItem(tag=tag, type="", url_test_time=0, url_test_delay=0)
+                    for tag in info["all"]
+                    if isinstance(tag, str)
+                ]
+                groups.append(
+                    SingBoxGroup(
+                        tag=name,
+                        type="Selector",
+                        selectable=True,
+                        selected=info.get("now", ""),
+                        is_expand=False,
+                        items=items,
+                    )
+                )
+        return groups, proxies
 
     async def get_connections(self) -> tuple[int, int, int, int]:
         """Return (active_connections, memory, upload_total, download_total)."""
