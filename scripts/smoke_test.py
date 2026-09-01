@@ -14,12 +14,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import types
 from pathlib import Path
 
-# Import grpc.py directly: the package __init__ requires homeassistant.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "custom_components" / "singbox"))
+# Load the integration package without homeassistant: register a fake
+# "singbox" package whose __path__ points at custom_components, so relative
+# imports inside grpc.py / clash.py / backend.py resolve normally.
+_PKG_DIR = Path(__file__).resolve().parents[1] / "custom_components" / "singbox"
+_pkg = types.ModuleType("singbox")
+_pkg.__path__ = [str(_PKG_DIR)]
+sys.modules["singbox"] = _pkg
 
-from grpc import (  # noqa: E402
+from singbox.backend import BACKEND_CLASH, BACKEND_GRPC, detect_backend  # noqa: E402
+from singbox.clash import ClashApiError, ClashClient  # noqa: E402
+from singbox.grpc import (  # noqa: E402
     GRPC_STATUS_NOT_FOUND,
     GRPC_STATUS_UNIMPLEMENTED,
     GRPC_STATUS_UNAUTHENTICATED,
@@ -27,7 +35,6 @@ from grpc import (  # noqa: E402
     SingBoxClient,
     decode_fields,
 )
-from clash import ClashApiError, ClashClient  # noqa: E402
 
 
 async def check(step: str, condition: bool, detail: str = "") -> None:
@@ -37,6 +44,19 @@ async def check(step: str, condition: bool, detail: str = "") -> None:
 
 
 async def run(args: argparse.Namespace) -> None:
+    # -- backend auto-detection ---------------------------------------------
+    grpc_client, backend = await detect_backend(
+        args.host, args.port, args.secret, args.tls, None
+    )
+    await check("detect_backend -> grpc", backend == BACKEND_GRPC, backend)
+    await grpc_client.close()
+
+    clash_client, backend = await detect_backend(
+        args.host, args.clash_port, args.secret, args.tls, None
+    )
+    await check("detect_backend -> clash", backend == BACKEND_CLASH, backend)
+    await clash_client.close()
+
     client = SingBoxClient(args.host, args.port, args.secret, args.tls)
     try:
         await _run_checks(args, client)

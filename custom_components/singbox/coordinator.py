@@ -16,6 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .backend import BACKEND_CLASH, BACKEND_GRPC
 from .clash import ClashApiError, ClashClient, POLL_INTERVAL_SECONDS
 from .const import DEFAULT_UPDATE_INTERVAL, DOMAIN
 from .grpc import (
@@ -30,9 +31,6 @@ from .grpc import (
 )
 
 _LOGGER = logging.getLogger(__package__)
-
-BACKEND_GRPC = "grpc"
-BACKEND_CLASH = "clash"
 
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 60.0

@@ -23,15 +23,16 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .clash import ClashApiError, ClashClient
+from .backend import detect_backend
+from .clash import ClashApiError
 from .const import (
     CONF_UPDATE_INTERVAL,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     PLATFORMS,
 )
-from .coordinator import BACKEND_CLASH, BACKEND_GRPC, SingBoxCoordinator
-from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError, SingBoxClient
+from .coordinator import SingBoxCoordinator
+from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
 
 _LOGGER = logging.getLogger(__package__)
 
@@ -55,7 +56,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
     session = async_get_clientsession(hass)
-    client, backend = await _detect_backend(host, port, secret, use_tls, session)
+    client, backend = await detect_backend(host, port, secret, use_tls, session)
     coordinator = SingBoxCoordinator(
         hass, entry, client, backend, update_interval_seconds=update_interval
     )
@@ -82,43 +83,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Reload the integration when options (host/port/secret/interval) change.
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     return True
-
-
-async def _detect_backend(
-    host: str,
-    port: int,
-    secret: str,
-    use_tls: bool,
-    session,
-) -> tuple[SingBoxClient | ClashClient, str]:
-    """Prefer the gRPC ``api`` service, fall back to the clash API.
-
-    Raises GrpcError(16) / ClashApiError(401) on authentication failure and
-    ConnectionError when the server is unreachable.
-    """
-    grpc_client = SingBoxClient(
-        host=host, port=port, secret=secret, use_tls=use_tls, session=session
-    )
-    try:
-        await grpc_client.get_version()
-    except GrpcError as err:
-        if err.status == GRPC_STATUS_UNAUTHENTICATED:
-            raise
-        _LOGGER.info("gRPC API not available (%s), falling back to clash API", err)
-    except (OSError, ConnectionError):
-        _LOGGER.info("gRPC API unreachable, falling back to clash API")
-    else:
-        return grpc_client, BACKEND_GRPC
-
-    clash_client = ClashClient(
-        host=host, port=port, secret=secret, use_tls=use_tls, session=session
-    )
-    try:
-        version = await clash_client.get_version()
-    except (OSError, ConnectionError) as err:
-        raise ConnectionError(f"cannot reach sing-box API: {err}") from err
-    _LOGGER.info("using clash API backend (sing-box %s)", version)
-    return clash_client, BACKEND_CLASH
 
 
 async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:

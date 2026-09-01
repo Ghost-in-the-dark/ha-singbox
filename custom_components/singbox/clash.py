@@ -32,10 +32,7 @@ from typing import Any, AsyncIterator
 
 import aiohttp
 
-try:
-    from .grpc import SingBoxGroup, SingBoxGroupItem
-except ImportError:  # standalone imports from scripts/smoke_test.py
-    from grpc import SingBoxGroup, SingBoxGroupItem  # type: ignore[no-redef]
+from .grpc import SingBoxGroup, SingBoxGroupItem
 
 _LOGGER = logging.getLogger(__package__)
 

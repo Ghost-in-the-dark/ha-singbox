@@ -29,6 +29,8 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from .backend import detect_backend
+from .clash import ClashApiError
 from .const import (
     CONF_UPDATE_INTERVAL,
     DEFAULT_PORT,
@@ -36,7 +38,7 @@ from .const import (
     DOMAIN,
     UPDATE_INTERVAL_OPTIONS,
 )
-from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError, SingBoxClient
+from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
 
 _LOGGER = logging.getLogger(__package__)
 
@@ -91,24 +93,28 @@ def _current_values(config_entry: ConfigEntry) -> dict[str, Any]:
 
 
 async def _validate_connection(user_input: dict[str, Any]) -> dict[str, str]:
-    client = SingBoxClient(
-        host=user_input[CONF_HOST],
-        port=user_input[CONF_PORT],
-        secret=user_input.get(CONF_PASSWORD, ""),
-        use_tls=user_input.get(CONF_SSL, False),
-    )
     try:
-        await client.get_version()
+        client, _backend = await detect_backend(
+            host=user_input[CONF_HOST],
+            port=user_input[CONF_PORT],
+            secret=user_input.get(CONF_PASSWORD, ""),
+            use_tls=user_input.get(CONF_SSL, False),
+            session=None,
+        )
     except GrpcError as err:
         if err.status == GRPC_STATUS_UNAUTHENTICATED:
             return {"base": "invalid_auth"}
         _LOGGER.error("sing-box API error during validation: %s", err)
         return {"base": "cannot_connect"}
+    except ClashApiError as err:
+        if err.status == 401:
+            return {"base": "invalid_auth"}
+        _LOGGER.error("sing-box clash API error during validation: %s", err)
+        return {"base": "cannot_connect"}
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ConnectionError) as err:
         _LOGGER.error("cannot connect to sing-box: %s", err)
         return {"base": "cannot_connect"}
-    finally:
-        await client.close()
+    await client.close()
     return {}
 
 
