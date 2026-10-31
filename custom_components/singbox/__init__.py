@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL
 from homeassistant.core import HomeAssistant, ServiceCall
@@ -26,7 +25,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
 from .backend import detect_backend
-from .clash import ClashApiError
+from .clash import ClashApiError, is_auth_error
 from .const import (
     CONF_UPDATE_INTERVAL,
     DEFAULT_UPDATE_INTERVAL,
@@ -34,9 +33,19 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import SingBoxCoordinator
+from .errors import SingBoxAuthError, SingBoxNotSupported
 from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
 
 _LOGGER = logging.getLogger(__package__)
+
+SERVICE_NAMES = (
+    "select_outbound",
+    "url_test",
+    "set_group_expand",
+    "close_connection",
+    "close_all_connections",
+    "set_clash_mode",
+)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -64,24 +73,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     try:
         await coordinator.async_setup()
+    except SingBoxAuthError as err:
+        await coordinator.async_shutdown()
+        raise ConfigEntryAuthFailed(f"sing-box API authentication failed: {err}") from err
     except GrpcError as err:
+        await coordinator.async_shutdown()
         if err.status == GRPC_STATUS_UNAUTHENTICATED:
-            raise ConfigEntryAuthFailed(
-                f"sing-box API authentication failed: {err}"
-            ) from err
+            raise ConfigEntryAuthFailed(f"sing-box API authentication failed: {err}") from err
         raise ConfigEntryNotReady(f"sing-box API error: {err}") from err
     except ClashApiError as err:
+        await coordinator.async_shutdown()
         if err.status == 401:
-            raise ConfigEntryAuthFailed(
-                f"sing-box clash API authentication failed: {err}"
-            ) from err
+            raise ConfigEntryAuthFailed(f"sing-box clash API authentication failed: {err}") from err
         raise ConfigEntryNotReady(f"sing-box clash API error: {err}") from err
     except (OSError, ConnectionError) as err:
+        await coordinator.async_shutdown()
         raise ConfigEntryNotReady(f"cannot reach sing-box API: {err}") from err
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    await _async_setup_services(hass)
+    await _async_setup_services(hass, entry)
     # Reload the integration when options (host/port/secret/interval) change.
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     return True
@@ -98,10 +109,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         coordinator: SingBoxCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await coordinator.async_shutdown()
+        if not any(isinstance(item, SingBoxCoordinator) for item in hass.data[DOMAIN].values()):
+            # The services resolve their coordinator from hass.data, so they
+            # must not outlive the last entry.
+            for name in SERVICE_NAMES:
+                if hass.services.has_service(DOMAIN, name):
+                    hass.services.async_remove(DOMAIN, name)
     return unload_ok
 
 
-async def _async_setup_services(hass: HomeAssistant) -> None:
+async def _async_setup_services(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Register the sing-box services (idempotent)."""
     if hass.services.has_service(DOMAIN, "select_outbound"):
         return
@@ -111,32 +128,30 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
         if entry_id is not None:
             coordinator = hass.data[DOMAIN].get(entry_id)
             if coordinator is None:
-                raise ServiceValidationError(
-                    f"No sing-box config entry with id {entry_id}"
-                )
+                raise ServiceValidationError(f"No sing-box config entry with id {entry_id}")
             return [coordinator]
-        coordinators = list(hass.data.get(DOMAIN, {}).values())
+        coordinators = [
+            item
+            for item in hass.data.get(DOMAIN, {}).values()
+            if isinstance(item, SingBoxCoordinator)
+        ]
+        if not coordinators:
+            raise ServiceValidationError("No sing-box config entry is loaded")
         if len(coordinators) != 1:
-            raise ServiceValidationError(
-                "Multiple sing-box entries configured; specify entry_id"
-            )
+            raise ServiceValidationError("Multiple sing-box entries configured; specify entry_id")
         return coordinators
 
     async def _select_outbound(call: ServiceCall) -> None:
         for coordinator in _entries(call):
-            await coordinator.select_outbound(
-                call.data["group_tag"], call.data["outbound_tag"]
-            )
+            await coordinator.select_outbound(call.data["group_tag"], call.data["outbound_tag"])
 
     async def _url_test(call: ServiceCall) -> None:
         for coordinator in _entries(call):
-            await coordinator.url_test(call.data["outbound_tag"])
+            await coordinator.url_test(call.data["outbound_tag"], call.data.get("url"))
 
     async def _set_group_expand(call: ServiceCall) -> None:
         for coordinator in _entries(call):
-            await coordinator.set_group_expand(
-                call.data["group_tag"], call.data["is_expand"]
-            )
+            await coordinator.set_group_expand(call.data["group_tag"], call.data["is_expand"])
 
     async def _close_connection(call: ServiceCall) -> None:
         for coordinator in _entries(call):
@@ -154,14 +169,24 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
         async def _inner(call: ServiceCall) -> None:
             try:
                 await fn(call)
-            except (ClashApiError, OSError, ConnectionError) as err:
+            except SingBoxNotSupported as err:
+                raise ServiceValidationError(str(err)) from err
+            except SingBoxAuthError as err:
+                if entry is not None:
+                    entry.async_start_reauth(hass)
+                raise HomeAssistantError(f"sing-box authentication failed: {err}") from err
+            except (ClashApiError, GrpcError) as err:
+                if is_auth_error(err) and entry is not None:
+                    entry.async_start_reauth(hass)
                 raise HomeAssistantError(f"sing-box API error: {err}") from err
+            except (OSError, ConnectionError, TimeoutError) as err:
+                raise HomeAssistantError(f"cannot reach the sing-box API: {err}") from err
 
         return _inner
 
     services = {
         "select_outbound": (_select_outbound, {"group_tag": cv.string, "outbound_tag": cv.string}),
-        "url_test": (_url_test, {"outbound_tag": cv.string}),
+        "url_test": (_url_test, {"outbound_tag": cv.string, vol.Optional("url"): cv.url}),
         "set_group_expand": (_set_group_expand, {"group_tag": cv.string, "is_expand": cv.boolean}),
         "close_connection": (_close_connection, {"connection_id": cv.string}),
         "close_all_connections": (_close_all_connections, {}),

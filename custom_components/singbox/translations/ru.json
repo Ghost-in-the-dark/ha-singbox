@@ -9,9 +9,15 @@
           "port": "Порт",
           "password": "Секрет API",
           "ssl": "Использовать TLS (https)",
-          "update_interval": "Интервал обновления статуса",
-          "speed_unit": "Единица измерения скорости"
+          "update_interval": "Интервал обновления статуса"
         }
+      },
+      "reauth_confirm": {
+        "title": "Повторная авторизация в sing-box",
+        "data": {
+          "password": "API-секрет"
+        },
+        "description": "API sing-box отклонил сохранённый секрет. Укажите действующий секрет, чтобы восстановить подключение."
       }
     },
     "error": {
@@ -19,7 +25,8 @@
       "invalid_auth": "Неверный секрет API. Проверьте секрет, заданный в сервисе api в конфигурации sing-box."
     },
     "abort": {
-      "already_configured": "Этот экземпляр sing-box уже настроен."
+      "already_configured": "Этот экземпляр sing-box уже настроен.",
+      "reauth_successful": "Авторизация выполнена успешно"
     }
   },
   "entity": {
@@ -74,8 +81,7 @@
           "port": "Порт",
           "password": "Секрет API",
           "ssl": "Использовать TLS (https)",
-          "update_interval": "Интервал обновления статуса",
-          "speed_unit": "Единица измерения скорости"
+          "update_interval": "Интервал обновления статуса"
         }
       }
     },

@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
 import voluptuous as vol
-
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
-    OptionsFlowWithConfigEntry,
+    OptionsFlow,
 )
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL
 from homeassistant.helpers.selector import (
@@ -32,13 +31,10 @@ from homeassistant.helpers.selector import (
 from .backend import detect_backend
 from .clash import ClashApiError
 from .const import (
-    CONF_SPEED_UNIT,
     CONF_UPDATE_INTERVAL,
     DEFAULT_PORT,
-    DEFAULT_SPEED_UNIT,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
-    SPEED_UNIT_OPTIONS,
     UPDATE_INTERVAL_OPTIONS,
 )
 from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
@@ -47,9 +43,7 @@ _LOGGER = logging.getLogger(__package__)
 
 CONNECTION_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_HOST): TextSelector(
-            TextSelectorConfig(type=TextSelectorType.TEXT)
-        ),
+        vol.Required(CONF_HOST): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
         vol.Required(CONF_PORT): NumberSelector(
             NumberSelectorConfig(min=1, max=65535, mode=NumberSelectorMode.BOX)
         ),
@@ -66,14 +60,6 @@ CONNECTION_SCHEMA = vol.Schema(
                 mode=SelectSelectorMode.DROPDOWN,
             )
         ),
-        vol.Required(CONF_SPEED_UNIT): SelectSelector(
-            SelectSelectorConfig(
-                options=[
-                    {"label": unit, "value": unit} for unit in SPEED_UNIT_OPTIONS
-                ],
-                mode=SelectSelectorMode.DROPDOWN,
-            )
-        ),
     }
 )
 
@@ -86,7 +72,6 @@ def _default_values(user_input: dict[str, Any] | None) -> dict[str, Any]:
         CONF_PASSWORD: "",
         CONF_SSL: False,
         CONF_UPDATE_INTERVAL: str(DEFAULT_UPDATE_INTERVAL),
-        CONF_SPEED_UNIT: DEFAULT_SPEED_UNIT,
     }
 
 
@@ -101,14 +86,17 @@ def _current_values(config_entry: ConfigEntry) -> dict[str, Any]:
                 config_entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
             )
         ),
-        CONF_SPEED_UNIT: config_entry.options.get(
-            CONF_SPEED_UNIT,
-            config_entry.data.get(CONF_SPEED_UNIT, DEFAULT_SPEED_UNIT),
-        ),
     }
 
 
 async def _validate_connection(user_input: dict[str, Any]) -> dict[str, str]:
+    """Check the entered connection settings.
+
+    The client owns its own aiohttp session here (session=None), so it must be
+    closed on *every* path: the previous layout returned from the except
+    branches and leaked the session ("Unclosed client session" in the log).
+    """
+    client = None
     try:
         client, _backend = await detect_backend(
             host=user_input[CONF_HOST],
@@ -127,10 +115,12 @@ async def _validate_connection(user_input: dict[str, Any]) -> dict[str, str]:
             return {"base": "invalid_auth"}
         _LOGGER.error("sing-box clash API error during validation: %s", err)
         return {"base": "cannot_connect"}
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ConnectionError) as err:
+    except (TimeoutError, aiohttp.ClientError, OSError, ConnectionError) as err:
         _LOGGER.error("cannot connect to sing-box: %s", err)
         return {"base": "cannot_connect"}
-    await client.close()
+    finally:
+        if client is not None:
+            await client.close()
     return {}
 
 
@@ -149,9 +139,7 @@ class SingBoxConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             errors = await _validate_connection(user_input)
@@ -172,22 +160,56 @@ class SingBoxConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> ConfigFlowResult:
+        """Handle an authentication failure reported at runtime."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for a new API secret."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            current = {
+                **(self._get_reauth_entry().data or {}),
+                **(self._get_reauth_entry().options or {}),
+                CONF_PASSWORD: user_input.get(CONF_PASSWORD, ""),
+            }
+            errors = await _validate_connection(current)
+            if not errors:
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(),
+                    data_updates={CONF_PASSWORD: user_input.get(CONF_PASSWORD, "")},
+                    options={},
+                )
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_PASSWORD): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
     @staticmethod
     def async_get_options_flow(config_entry: ConfigEntry) -> SingBoxOptionsFlow:
         """Create the options flow."""
-        return SingBoxOptionsFlow(config_entry)
+        return SingBoxOptionsFlow()
 
 
-class SingBoxOptionsFlow(OptionsFlowWithConfigEntry):
+class SingBoxOptionsFlow(OptionsFlow):
     """Handle an options flow for sing-box.
 
-    A config entry update listener reloads the integration after the options
-    change (see __init__.py).
+    OptionsFlowWithConfigEntry is deprecated in Home Assistant core; the
+    config entry is available as self.config_entry. A config entry update
+    listener reloads the integration after the options change (see
+    __init__.py).
     """
 
-    async def async_step_init(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             errors = await _validate_connection(user_input)

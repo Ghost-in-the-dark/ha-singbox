@@ -43,6 +43,15 @@ url_test:
       example: auto
       selector:
         text:
+    url:
+      name: Test URL
+      description: >-
+        URL used for the test. Ignored on the gRPC backend, which always uses
+        the URL configured in sing-box.
+      required: false
+      example: https://www.gstatic.com/generate_204
+      selector:
+        text:
 
 set_group_expand:
   name: Set group expand

@@ -4,7 +4,12 @@ sing-box pushes data over its gRPC ``api`` service (SubscribeStatus /
 SubscribeGroups streams); on versions without that service (clash_api only)
 the same data is gathered from the Clash REST/WebSocket API. The coordinator
 keeps the backend streams alive, reconnects with exponential backoff on
-failure and exposes the latest snapshot to the entities.
+failure, supervises the stream tasks and exposes the latest snapshot to the
+entities.
+
+State pushes are throttled (``_PUSH_MIN_INTERVAL``): backend frames arrive every
+second, but forwarding each of them through Home Assistant floods the state
+machine and the recorder.
 """
 
 from __future__ import annotations
@@ -12,20 +17,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.update_coordinator import (
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
 
-from .backend import BACKEND_CLASH, BACKEND_GRPC
-from .clash import ClashApiError, ClashClient, POLL_INTERVAL_SECONDS
+from .backend import BACKEND_GRPC
+from .clash import POLL_INTERVAL_SECONDS, ClashApiError, ClashClient, is_auth_error
 from .const import DEFAULT_UPDATE_INTERVAL, DOMAIN
+from .errors import SingBoxAuthError, SingBoxNotSupported
 from .grpc import (
     GRPC_STATUS_NOT_FOUND,
-    GRPC_STATUS_UNAUTHENTICATED,
     GrpcError,
     SingBoxClient,
     SingBoxGroup,
+    SingBoxGroupItem,
     SingBoxStatus,
     _bool,
     _int,
@@ -36,13 +46,15 @@ _LOGGER = logging.getLogger(__package__)
 
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 60.0
+_POLL_TIMEOUT = 15.0
 
-# Minimum time between coordinator -> entity state pushes. Backend streams
-# (clash WS /traffic, gRPC SubscribeStatus) can deliver frames every second;
-# forwarding each one through HA floods the state machine and the recorder
-# with writes, which over days grows the SQLite DB and HA's memory usage
-# until the host runs out of RAM.
+# Minimum time between coordinator -> entity state pushes.
 _PUSH_MIN_INTERVAL = 5.0
+
+# Guards against a division blow-up when two status frames arrive back to
+# back (e.g. a reconnect delivering a frame immediately after the previous
+# one) while still keeping the rate meaningful.
+_MIN_RATE_WINDOW = 0.5
 
 
 class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
@@ -56,25 +68,45 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         backend: str,
         update_interval_seconds: int = DEFAULT_UPDATE_INTERVAL,
     ) -> None:
+        # The update interval is not a push interval: the stream frames drive
+        # the data, and this only paces the health poll that also supervises
+        # the stream tasks (and is the sole source of data on a backend whose
+        # streams stay down).
+        poll_interval = max(
+            float(update_interval_seconds), _PUSH_MIN_INTERVAL, POLL_INTERVAL_SECONDS
+        )
         super().__init__(
-            hass, _LOGGER, name=DOMAIN, update_interval=None, config_entry=entry
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=poll_interval),
+            config_entry=entry,
         )
         self.client = client
         self.backend = backend
         self.data = SingBoxStatus()
+        self._stream_factories: list = []
         self._stream_tasks: list[asyncio.Task] = []
-        # State pushes are throttled (see _PUSH_MIN_INTERVAL) so the 1s
-        # backend frames do not flood HA with writes.
         self._push_interval = max(float(update_interval_seconds), _PUSH_MIN_INTERVAL)
         self._last_push_ts = 0.0
         self.clash_mode_available = False
         self._groups_ready = asyncio.Event()
-        # Set when the entry is unloaded, so streams can stop waiting out a
-        # reconnect backoff while Home Assistant is shutting down.
         self._shutdown = asyncio.Event()
         # SubscribeStatus interval is a Go time.Duration, i.e. nanoseconds.
         self._interval_seconds = update_interval_seconds
         self._interval_ns = update_interval_seconds * 1_000_000_000
+        # Traffic is accumulated between pushes so the reported speed is the
+        # average over the real elapsed time, not a single 1s frame.
+        self._rate_window_start = time.monotonic()
+        self._rate_up_bytes = 0
+        self._rate_down_bytes = 0
+        self._discovery_listeners: list = []
+        # Tag -> object indexes, rebuilt on every groups snapshot: looking a
+        # proxy up by tag used to be a linear scan per sensor per push.
+        self._groups_index: dict[str, SingBoxGroup] = {}
+        self._proxies_index: dict[str, SingBoxGroupItem] = {}
+
+    # -- lifecycle ----------------------------------------------------------
 
     async def async_setup(self) -> None:
         """Fetch static info and start the backend streams."""
@@ -82,11 +114,14 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             await self._setup_grpc()
         else:
             await self._setup_clash()
+        # The groups snapshot only arrives through a stream, so the streams
+        # must be running before waiting for it.
+        self._start_streams()
         # Entities for outbound groups are created at platform setup, so wait
         # for the first groups snapshot before proceeding.
         try:
             await asyncio.wait_for(self._groups_ready.wait(), timeout=10)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _LOGGER.warning("no groups received from sing-box within 10s")
 
     async def _setup_grpc(self) -> None:
@@ -96,7 +131,7 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             self.data.version = version
             self.data.api_version = api_version
             self.data.started_at = await client.get_started_at()
-        except (asyncio.TimeoutError, OSError, ConnectionError) as err:
+        except (TimeoutError, OSError, ConnectionError) as err:
             raise ConnectionError(f"cannot reach sing-box API: {err}") from err
 
         try:
@@ -109,16 +144,16 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
                 _LOGGER.warning("clash mode unavailable: %s", err)
             self.clash_mode_available = False
 
-        self._stream_tasks = [
-            asyncio.create_task(self._run_grpc_status_stream()),
-            asyncio.create_task(self._run_groups_stream()),
+        self._stream_factories = [
+            self._run_grpc_status_stream,
+            self._run_groups_stream,
         ]
 
     async def _setup_clash(self) -> None:
         client: ClashClient = self.client
         try:
             self.data.version = await client.get_version()
-        except (asyncio.TimeoutError, OSError, ConnectionError) as err:
+        except (TimeoutError, OSError, ConnectionError) as err:
             raise ConnectionError(f"cannot reach sing-box API: {err}") from err
 
         try:
@@ -130,9 +165,9 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             _LOGGER.warning("clash mode unavailable: %s", err)
             self.clash_mode_available = False
 
-        self._stream_tasks = [
-            asyncio.create_task(self._run_clash_traffic_stream()),
-            asyncio.create_task(self._run_clash_poll_loop()),
+        self._stream_factories = [
+            self._run_clash_traffic_stream,
+            self._run_clash_poll_loop,
         ]
 
     async def async_shutdown(self) -> None:
@@ -149,6 +184,94 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             self._stream_tasks.clear()
         await self.client.close()
 
+    def _start_streams(self) -> None:
+        if not self._stream_factories:
+            return
+        self._stream_tasks = [asyncio.create_task(factory()) for factory in self._stream_factories]
+
+    # -- discovery ----------------------------------------------------------
+
+    @callback
+    def async_add_discovery_listener(self, update_callback) -> None:
+        """Register a callback for new groups / proxies appearing upstream."""
+        self._discovery_listeners.append(update_callback)
+
+    @callback
+    def async_remove_discovery_listener(self, update_callback) -> None:
+        """Remove a discovery callback."""
+        self._discovery_listeners.remove(update_callback)
+
+    @callback
+    def _notify_discovery(self) -> None:
+        for update_callback in list(self._discovery_listeners):
+            update_callback()
+
+    # -- DataUpdateCoordinator ----------------------------------------------
+
+    async def _async_update_data(self) -> SingBoxStatus:
+        """Health poll: refresh the snapshot and supervise the stream tasks.
+
+        Streams deliver the data on the gRPC backend; this poll keeps the entry
+        honest when a stream is wedged (a stream task that died silently left
+        the sensors frozen and *available*), and is the only source of data on
+        the clash backend when its WebSocket is unreachable.
+        """
+        self._supervise_stream_tasks()
+        try:
+            if self.backend == BACKEND_GRPC:
+                await asyncio.wait_for(self._poll_grpc(), timeout=_POLL_TIMEOUT)
+            else:
+                await asyncio.wait_for(self._poll_clash(), timeout=_POLL_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except (SingBoxAuthError, ClashApiError, GrpcError) as err:
+            if is_auth_error(err):
+                self._mark_unavailable(err)
+                raise UpdateFailed(f"authentication failed: {err}") from err
+            self._mark_unavailable(err)
+            raise UpdateFailed(f"sing-box API error: {err}") from err
+        except (TimeoutError, OSError, ConnectionError) as err:
+            self._mark_unavailable(err)
+            raise UpdateFailed(f"cannot reach sing-box API: {err}") from err
+        except Exception as err:  # noqa: BLE001 - never kill the coordinator
+            _LOGGER.exception("sing-box poll failed: %s", err)
+            self._mark_unavailable(err)
+            raise UpdateFailed(f"unexpected sing-box error: {err}") from err
+        self._last_push_ts = time.monotonic()
+        return self.data
+
+    async def _poll_grpc(self) -> None:
+        client: SingBoxClient = self.client
+        self.data.version, self.data.api_version = await client.get_version()
+
+    async def _poll_clash(self) -> None:
+        client: ClashClient = self.client
+        groups, proxies = await client.get_proxies()
+        self._set_groups(groups, proxies)
+        await self._apply_clash_mode()
+        await self._apply_clash_connections()
+
+    def _supervise_stream_tasks(self) -> None:
+        """Restart stream tasks that died instead of reconnecting."""
+        if self._shutdown.is_set() or not self._stream_tasks:
+            return
+        for index, task in enumerate(self._stream_tasks):
+            if not task.done():
+                continue
+            if task.cancelled():
+                _LOGGER.warning("sing-box stream task was cancelled; restarting")
+            else:
+                exc = task.exception()
+                if exc is not None:
+                    _LOGGER.error(
+                        "sing-box stream task died (%s: %s); restarting",
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    _LOGGER.warning("sing-box stream task finished; restarting")
+            self._stream_tasks[index] = asyncio.create_task(self._stream_factories[index]())
+
     # -- streams ------------------------------------------------------------
 
     async def _pause(self, delay: float) -> bool:
@@ -161,112 +284,74 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         if delay <= 0:
             return True
         try:
-            await asyncio.wait_for(
-                self._shutdown.wait(), timeout=max(delay, _MIN_BACKOFF)
-            )
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(self._shutdown.wait(), timeout=max(delay, _MIN_BACKOFF))
+        except TimeoutError:
             return True
         return False
 
-    async def _run_grpc_status_stream(self) -> None:
+    async def _run_stream(self, name: str, stream, apply) -> None:
+        """Consume one backend stream, reconnecting with backoff.
+
+        Every exception is caught here: an unhandled error used to kill the
+        task silently, leaving ``last_update_success`` True and the entities
+        stuck on stale data with nothing in the log.
+        """
         backoff = _MIN_BACKOFF
         while True:
             try:
-                async for fields in self.client.subscribe_status(self._interval_ns):
-                    self._apply_status(fields)
+                async for payload in stream():
+                    apply(payload)
                     backoff = _MIN_BACKOFF
                     self._mark_available()
             except asyncio.CancelledError:
                 raise
-            except GrpcError as err:
-                _LOGGER.error("status stream failed: %s", err)
-                if err.status == GRPC_STATUS_UNAUTHENTICATED:
+            except Exception as err:  # noqa: BLE001 - keep the stream alive
+                if is_auth_error(err):
+                    _LOGGER.error("sing-box %s stream: authentication failed (%s)", name, err)
                     self._mark_unavailable(err)
+                    if self.config_entry is not None:
+                        self.config_entry.async_start_reauth(self.hass)
                     return
-            except (asyncio.TimeoutError, OSError, ConnectionError) as err:
-                _LOGGER.warning("status stream lost: %s", err)
+                _LOGGER.warning("sing-box %s stream lost: %s", name, err)
             self._mark_unavailable(None)
             if not await self._pause(backoff):
                 return
             backoff = min(backoff * 2, _MAX_BACKOFF)
+
+    async def _run_grpc_status_stream(self) -> None:
+        await self._run_stream(
+            "status",
+            lambda: self.client.subscribe_status(self._interval_ns),
+            self._apply_status,
+        )
 
     async def _run_groups_stream(self) -> None:
-        backoff = _MIN_BACKOFF
-        while True:
-            try:
-                async for groups in self.client.subscribe_groups():
-                    self.data.groups = groups
-                    self.data.proxies = flatten_proxies(groups)
-                    self._groups_ready.set()
-                    backoff = _MIN_BACKOFF
-                    self._mark_available()
-            except asyncio.CancelledError:
-                raise
-            except GrpcError as err:
-                _LOGGER.error("groups stream failed: %s", err)
-                if err.status == GRPC_STATUS_UNAUTHENTICATED:
-                    self._mark_unavailable(err)
-                    return
-            except (asyncio.TimeoutError, OSError, ConnectionError) as err:
-                _LOGGER.warning("groups stream lost: %s", err)
-            self._mark_unavailable(None)
-            if not await self._pause(backoff):
-                return
-            backoff = min(backoff * 2, _MAX_BACKOFF)
+        await self._run_stream("groups", self.client.subscribe_groups, self._apply_groups)
 
     async def _run_clash_traffic_stream(self) -> None:
-        backoff = _MIN_BACKOFF
-        while True:
-            try:
-                async for up, down in self.client.traffic_stream():
-                    self.data.uplink = up
-                    self.data.downlink = down
-                    backoff = _MIN_BACKOFF
-                    self._mark_available()
-            except asyncio.CancelledError:
-                raise
-            except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
-                _LOGGER.error("traffic stream failed: %s", err)
-            except (ValueError, TypeError) as err:
-                _LOGGER.error("traffic stream returned a malformed frame: %s", err)
-            except Exception as err:  # noqa: BLE001 - keep the stream alive
-                _LOGGER.exception("traffic stream crashed: %s", err)
-            self._mark_unavailable(None)
-            if not await self._pause(backoff):
-                return
-            backoff = min(backoff * 2, _MAX_BACKOFF)
+        await self._run_stream("traffic", self.client.traffic_stream, self._apply_traffic)
 
     async def _run_clash_poll_loop(self) -> None:
-        backoff = _MIN_BACKOFF
         interval = max(self._interval_seconds, POLL_INTERVAL_SECONDS)
+        backoff = _MIN_BACKOFF
         while True:
             try:
                 groups, proxies = await self.client.get_proxies()
-                self.data.groups = groups
-                self.data.proxies = proxies
-                self._groups_ready.set()
+                self._set_groups(groups, proxies)
                 await self._apply_clash_mode()
                 await self._apply_clash_connections()
                 backoff = _MIN_BACKOFF
                 self._mark_available()
             except asyncio.CancelledError:
                 raise
-            except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
-                _LOGGER.warning("clash poll failed: %s", err)
-                self._mark_unavailable(None)
-                if not await self._pause(backoff):
-                    return
-                backoff = min(backoff * 2, _MAX_BACKOFF)
-                continue
-            except (ValueError, TypeError) as err:
-                _LOGGER.error("clash poll returned a malformed response: %s", err)
-                self._mark_unavailable(None)
-                if not await self._pause(backoff):
-                    return
-                backoff = min(backoff * 2, _MAX_BACKOFF)
-                continue
             except Exception as err:  # noqa: BLE001 - keep the loop alive
-                _LOGGER.exception("clash poll loop crashed: %s", err)
+                if is_auth_error(err):
+                    _LOGGER.error("clash API authentication failed: %s", err)
+                    self._mark_unavailable(err)
+                    if self.config_entry is not None:
+                        self.config_entry.async_start_reauth(self.hass)
+                    return
+                _LOGGER.warning("clash poll failed: %s", err)
                 self._mark_unavailable(None)
                 if not await self._pause(backoff):
                     return
@@ -278,17 +363,21 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
     async def _apply_clash_mode(self) -> None:
         try:
             mode_list, current = await self.client.get_configs()
-        except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
+        except (TimeoutError, ClashApiError, OSError, ConnectionError) as err:
             _LOGGER.warning("clash mode poll failed: %s", err)
             return
         self.data.clash_mode_list = mode_list
         self.data.clash_mode = current
-        self.clash_mode_available = True
+        if not self.clash_mode_available:
+            # The clash mode select is created lazily, so let the platforms
+            # know that it became available after setup.
+            self.clash_mode_available = True
+            self._notify_discovery()
 
     async def _apply_clash_connections(self) -> None:
         try:
             n, memory, upload_total, download_total = await self.client.get_connections()
-        except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
+        except (TimeoutError, ClashApiError, OSError, ConnectionError) as err:
             _LOGGER.warning("clash connections snapshot failed: %s", err)
             return
         self.data.connections_in = n
@@ -296,18 +385,70 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self.data.uplink_total = upload_total
         self.data.downlink_total = download_total
 
+    # -- snapshot updates ---------------------------------------------------
+
+    def _set_groups(self, groups: list[SingBoxGroup], proxies: list[SingBoxGroupItem]) -> None:
+        self.data.groups = groups
+        self.data.proxies = proxies
+        self._groups_index = {group.tag: group for group in groups}
+        self._proxies_index = {proxy.tag: proxy for proxy in proxies}
+        self._groups_ready.set()
+
+    def _apply_groups(self, groups: list[SingBoxGroup]) -> None:
+        self._set_groups(groups, flatten_proxies(groups))
+
+    def _apply_traffic(self, frame: tuple[int, int]) -> None:
+        # The WS /traffic frame only carries per-second deltas; the running
+        # totals come from /connections, so they are not accumulated here
+        # (that would double count what the poll has already reported).
+        up, down = frame
+        self._add_traffic(up, down)
+
+    def _apply_status(self, fields: dict[int, list[int | bytes]]) -> None:
+        self.data.memory = _int(fields, 1)
+        self.data.goroutines = _int(fields, 2)
+        self.data.connections_in = _int(fields, 3)
+        self.data.connections_out = _int(fields, 4)
+        self.data.traffic_available = _bool(fields, 5)
+        # Fields 6/7 are byte deltas since the previous frame; they are summed
+        # and divided by the real elapsed time when the snapshot is pushed.
+        self._add_traffic(_int(fields, 6), _int(fields, 7))
+        self.data.uplink_total = _int(fields, 8)
+        self.data.downlink_total = _int(fields, 9)
+
+    def _add_traffic(self, up: int, down: int) -> None:
+        self._rate_up_bytes += max(int(up), 0)
+        self._rate_down_bytes += max(int(down), 0)
+
+    def _flush_traffic_rate(self, now: float) -> None:
+        elapsed = max(now - self._rate_window_start, _MIN_RATE_WINDOW)
+        self.data.uplink = self._rate_up_bytes / elapsed
+        self.data.downlink = self._rate_down_bytes / elapsed
+        self._rate_up_bytes = 0
+        self._rate_down_bytes = 0
+        self._rate_window_start = now
+
     def _push_due(self) -> bool:
         return time.monotonic() - self._last_push_ts >= self._push_interval
 
     def _mark_available(self) -> None:
-        # Availability flips immediately; the data push itself is throttled so
-        # per-second stream frames do not generate a state write each time.
+        """Note that the backend is alive; push at most every _push_interval."""
+        now = time.monotonic()
         recovering = not self.last_update_success
         if recovering:
+            # Recover immediately so entities flip back to available.
             self.last_update_success = True
-        if recovering or self._push_due():
-            self._last_push_ts = time.monotonic()
+            self._flush_traffic_rate(now)
+            self._last_push_ts = now
             self.async_set_updated_data(self.data)
+            self._notify_discovery()
+            return
+        if now - self._last_push_ts < self._push_interval:
+            return
+        self._flush_traffic_rate(now)
+        self._last_push_ts = now
+        self.async_set_updated_data(self.data)
+        self._notify_discovery()
 
     def _mark_unavailable(self, err: Exception | None) -> None:
         if self.last_update_success:
@@ -315,20 +456,41 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self.last_update_success = False
         self.async_update_listeners()
 
+    # -- lookups ------------------------------------------------------------
+
+    @property
+    def stream_tasks(self) -> list[asyncio.Task]:
+        """The running backend stream tasks (for diagnostics)."""
+        return list(self._stream_tasks)
+
+    @property
+    def groups_index(self) -> dict[str, SingBoxGroup]:
+        return self._groups_index
+
+    @property
+    def proxies_index(self) -> dict[str, SingBoxGroupItem]:
+        return self._proxies_index
+
+    def group(self, tag: str) -> SingBoxGroup | None:
+        return self._groups_index.get(tag)
+
+    def proxy(self, tag: str) -> SingBoxGroupItem | None:
+        return self._proxies_index.get(tag)
+
     # -- control helpers (called by services/entities) ----------------------
 
     async def select_outbound(self, group_tag: str, outbound_tag: str) -> None:
         await self.client.select_outbound(group_tag, outbound_tag)
 
     async def set_group_expand(self, group_tag: str, is_expand: bool) -> None:
-        if self.backend == BACKEND_GRPC:
-            await self.client.set_group_expand(group_tag, is_expand)
-            return
-        raise ClashApiError(
-            0, "set_group_expand is not supported by the clash API"
-        )
+        if self.backend != BACKEND_GRPC:
+            raise SingBoxNotSupported("expanding a group is not supported by the clash API backend")
+        await self.client.set_group_expand(group_tag, is_expand)
 
     async def url_test(self, outbound_tag: str, url: str | None = None) -> None:
+        if self.backend == BACKEND_GRPC:
+            await self.client.url_test(outbound_tag)
+            return
         await self.client.url_test(outbound_tag, url)
 
     async def close_connection(self, connection_id: str) -> None:
@@ -341,19 +503,3 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         await self.client.set_clash_mode(mode)
         self.data.clash_mode = mode
         self.async_set_updated_data(self.data)
-
-    def group(self, tag: str) -> SingBoxGroup | None:
-        return next((g for g in self.data.groups if g.tag == tag), None)
-
-    def _apply_status(self, fields: dict[int, list[int | bytes]]) -> None:
-        self.data.memory = _int(fields, 1)
-        self.data.goroutines = _int(fields, 2)
-        self.data.connections_in = _int(fields, 3)
-        self.data.connections_out = _int(fields, 4)
-        self.data.traffic_available = _bool(fields, 5)
-        # uplink/downlink are byte deltas since the previous frame; dividing by
-        # the frame interval yields bytes per second.
-        self.data.uplink = _int(fields, 6) / self._interval_seconds
-        self.data.downlink = _int(fields, 7) / self._interval_seconds
-        self.data.uplink_total = _int(fields, 8)
-        self.data.downlink_total = _int(fields, 9)

@@ -9,9 +9,15 @@
           "port": "Port",
           "password": "API secret",
           "ssl": "Use TLS (https)",
-          "update_interval": "Status update interval",
-          "speed_unit": "Speed unit"
+          "update_interval": "Status update interval"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate sing-box",
+        "data": {
+          "password": "API secret"
+        },
+        "description": "The sing-box API rejected the configured secret. Enter a valid one to reconnect."
       }
     },
     "error": {
@@ -19,7 +25,8 @@
       "invalid_auth": "Invalid API secret. Check the secret configured in the sing-box api service."
     },
     "abort": {
-      "already_configured": "This sing-box instance is already configured."
+      "already_configured": "This sing-box instance is already configured.",
+      "reauth_successful": "Authentication was successful"
     }
   },
   "entity": {
@@ -74,8 +81,7 @@
           "port": "Port",
           "password": "API secret",
           "ssl": "Use TLS (https)",
-          "update_interval": "Status update interval",
-          "speed_unit": "Speed unit"
+          "update_interval": "Status update interval"
         }
       }
     },

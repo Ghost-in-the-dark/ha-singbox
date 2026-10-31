@@ -19,18 +19,20 @@ Wire details (all verified against sing-box 1.14.0):
 
 from __future__ import annotations
 
-import asyncio
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import AsyncIterator
 
 import aiohttp
+
+from .errors import SingBoxError
 
 _LOGGER = logging.getLogger(__package__)
 
 GRPC_WEB_CONTENT_TYPE = "application/grpc-web+proto"
 
 GRPC_STATUS_OK = 0
+GRPC_STATUS_UNKNOWN = 2
 GRPC_STATUS_NOT_FOUND = 5
 GRPC_STATUS_UNIMPLEMENTED = 12
 GRPC_STATUS_UNAUTHENTICATED = 16
@@ -42,7 +44,7 @@ _STREAM_IDLE_TIMEOUT = 45.0
 _SERVICE_PATH = "/daemon.StartedService/"
 
 
-class GrpcError(Exception):
+class GrpcError(SingBoxError):
     """A gRPC call failed with a non-OK status code."""
 
     def __init__(self, status: int, message: str | None = None) -> None:
@@ -53,6 +55,7 @@ class GrpcError(Exception):
 # ---------------------------------------------------------------------------
 # protobuf wire format
 # ---------------------------------------------------------------------------
+
 
 def _varint(value: int) -> bytes:
     out = bytearray()
@@ -67,12 +70,16 @@ def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
     result = 0
     shift = 0
     while True:
+        if pos >= len(data):
+            raise ValueError("truncated protobuf varint")
         byte = data[pos]
         pos += 1
         result |= (byte & 0x7F) << shift
         if not byte & 0x80:
             return result, pos
         shift += 7
+        if shift >= 64:
+            raise ValueError("protobuf varint is too long")
 
 
 def _field_varint(num: int, value: int) -> bytes:
@@ -116,7 +123,13 @@ def clash_mode_request(mode: str) -> bytes:
 
 
 def decode_fields(data: bytes) -> dict[int, list[int | bytes]]:
-    """Decode a protobuf message into {field_number: [values]}."""
+    """Decode a protobuf message into {field_number: [values]}.
+
+    Truncated messages raise ValueError: a short length-delimited field used to
+    be silently sliced (b"\x0a\x05ab" decoded as "ab") and a truncated varint
+    raised a bare IndexError that bypassed the callers' malformed-frame
+    handling.
+    """
     fields: dict[int, list[int | bytes]] = {}
     pos = 0
     while pos < len(data):
@@ -126,12 +139,21 @@ def decode_fields(data: bytes) -> dict[int, list[int | bytes]]:
             value, pos = _read_varint(data, pos)
         elif wire == 2:
             length, pos = _read_varint(data, pos)
+            if pos + length > len(data):
+                raise ValueError(
+                    f"truncated protobuf field {num}: need {length} bytes, "
+                    f"{len(data) - pos} available"
+                )
             value = data[pos : pos + length]
             pos += length
         elif wire == 5:
+            if pos + 4 > len(data):
+                raise ValueError(f"truncated protobuf field {num}")
             value = data[pos : pos + 4]
             pos += 4
         elif wire == 1:
+            if pos + 8 > len(data):
+                raise ValueError(f"truncated protobuf field {num}")
             value = data[pos : pos + 8]
             pos += 8
         else:
@@ -167,6 +189,7 @@ def _str_list(fields: dict[int, list[int | bytes]], num: int) -> list[str]:
 # ---------------------------------------------------------------------------
 # data model
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SingBoxGroupItem:
@@ -212,6 +235,7 @@ class SingBoxStatus:
 # gRPC-Web framing
 # ---------------------------------------------------------------------------
 
+
 def _data_frame(payload: bytes) -> bytes:
     return b"\x00" + len(payload).to_bytes(4, "big") + payload
 
@@ -233,10 +257,19 @@ def _parse_trailer(payload: bytes) -> tuple[int, str | None]:
     status = GRPC_STATUS_OK
     message: str | None = None
     for line in payload.decode(errors="replace").splitlines():
-        if line.startswith("grpc-status:"):
-            status = int(line.split(":", 1)[1].strip())
-        elif line.startswith("grpc-message:"):
-            message = line.split(":", 1)[1].strip()
+        name, _, raw = line.partition(":")
+        value = raw.strip()
+        if name == "grpc-status":
+            try:
+                status = int(value)
+            except ValueError:
+                # Unparsable status (e.g. a non-gRPC server answering on the
+                # RPC path): report it as an unknown gRPC failure instead of
+                # raising a ValueError that kills the stream task.
+                status = GRPC_STATUS_UNKNOWN
+                message = message or f"invalid grpc-status: {value!r}"
+        elif name == "grpc-message":
+            message = value
     return status, message
 
 
@@ -244,7 +277,13 @@ def _parse_status_response(headers, body: bytes) -> tuple[int, str | None]:
     """Extract the gRPC status from a response (headers or trailer frame)."""
     header_status = headers.get("grpc-status")
     if header_status is not None:
-        return int(header_status), headers.get("grpc-message")
+        try:
+            return int(header_status), headers.get("grpc-message")
+        except ValueError:
+            return (
+                GRPC_STATUS_UNKNOWN,
+                f"invalid grpc-status header: {header_status!r}",
+            )
     for is_trailer, payload in _iter_frames(body):
         if is_trailer:
             return _parse_trailer(payload)
@@ -263,6 +302,7 @@ def _iter_frames(body: bytes) -> AsyncIterator[tuple[bool, bytes]]:
 # ---------------------------------------------------------------------------
 # client
 # ---------------------------------------------------------------------------
+
 
 class SingBoxClient:
     """Async client for the sing-box ``api`` service over gRPC-Web."""
@@ -326,19 +366,28 @@ class SingBoxClient:
             raise ConnectionError(f"cannot reach sing-box API at {self._base_url}: {err}") from err
         if status != GRPC_STATUS_OK:
             raise GrpcError(status, message or f"RPC {method} failed")
-        messages = [
-            payload for is_trailer, payload in _iter_frames(body) if not is_trailer
-        ]
+        messages = [payload for is_trailer, payload in _iter_frames(body) if not is_trailer]
         return messages[0] if messages else None
 
     async def stream(self, method: str, request: bytes) -> AsyncIterator[bytes]:
-        """Server-streaming RPC: yields message payloads as they arrive."""
+        """Server-streaming RPC: yields message payloads as they arrive.
+
+        The idle timeout is enforced by aiohttp (sock_read) instead of an
+        asyncio.wait_for() around every read(): the wrapper allocated a
+        TimerHandle and a Context per chunk - the same allocation pattern that
+        caused the WebSocket OOM - and the session-wide default total timeout
+        silently capped the whole stream at 5 minutes anyway.
+        """
         session = await self._request_session()
-        resp = await session.post(
-            self._url(method),
-            data=_data_frame(request),
-            headers=self._headers(),
-        )
+        try:
+            resp = await session.post(
+                self._url(method),
+                data=_data_frame(request),
+                headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=_STREAM_IDLE_TIMEOUT),
+            )
+        except aiohttp.ClientError as err:
+            raise ConnectionError(f"cannot reach sing-box API at {self._base_url}: {err}") from err
         try:
             if resp.status != 200:
                 body = await resp.read()
@@ -347,11 +396,11 @@ class SingBoxClient:
             buf = bytearray()
             while True:
                 try:
-                    chunk = await asyncio.wait_for(
-                        resp.content.read(4096), timeout=_STREAM_IDLE_TIMEOUT
-                    )
-                except asyncio.TimeoutError as err:
-                    raise ConnectionError(f"stream {method} idle timeout") from err
+                    chunk = await resp.content.read(4096)
+                except (TimeoutError, aiohttp.ClientError) as err:
+                    # sock_read fires as ServerTimeoutError (a ClientError);
+                    # some aiohttp builds raise a plain TimeoutError.
+                    raise ConnectionError(f"stream {method} lost: {err}") from err
                 if not chunk:
                     break
                 buf.extend(chunk)
@@ -390,7 +439,9 @@ class SingBoxClient:
     async def set_clash_mode(self, mode: str) -> None:
         await self.unary("SetClashMode", clash_mode_request(mode))
 
-    async def subscribe_status(self, interval_ns: int) -> AsyncIterator[dict[int, list[int | bytes]]]:
+    async def subscribe_status(
+        self, interval_ns: int
+    ) -> AsyncIterator[dict[int, list[int | bytes]]]:
         async for payload in self.stream("SubscribeStatus", subscribe_status_request(interval_ns)):
             yield decode_fields(payload)
 

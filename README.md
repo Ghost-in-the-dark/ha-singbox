@@ -22,21 +22,25 @@ Either way, no Python packages need to be installed.
 
 - **Live monitoring**:
   - memory usage, goroutines, active connections
-  - uplink / downlink speed
+  - uplink / downlink speed (averaged over the push interval)
   - uplink / downlink totals (session counters)
   - version, API version, start time
 - **Control**:
-  - a **select entity per outbound group** (selector) — switch proxies from
-    the UI, automations or dashboards
+  - a **select entity per outbound group** (selector, url-test and fallback
+    groups) — switch proxies from the UI, automations or dashboards
   - a **clash mode select** when the [clash API](https://sing-box.sagernet.org/configuration/experimental/clash-api/)
     is enabled in sing-box
   - services: `select_outbound`, `url_test`, `set_group_expand`,
     `close_connection`, `close_all_connections`, `set_clash_mode`
-- Automatic reconnection with exponential backoff if the connection drops.
+- Automatic reconnection with exponential backoff if the connection drops;
+  a stream that dies is restarted, and a rejected secret starts a reauth
+  flow instead of failing silently.
+- **Diagnostics** download (Settings → Devices & Services → sing-box → ⋮ →
+  Download diagnostics) for issue reports.
 
 ## Requirements
 
-- Home Assistant 2024.6 or newer
+- Home Assistant 2024.11 or newer
 - sing-box with either the `api` service (>= 1.14.0) or the `clash_api`
   controller enabled
 
@@ -118,10 +122,10 @@ The integration reloads automatically when options are saved.
 | sing-box Memory | sensor | data size (B) |
 | sing-box Goroutines | sensor | diagnostics; gRPC-only |
 | sing-box Connections in / out | sensor | active connections; on the clash backend "out" is unavailable |
-| sing-box Uplink / Downlink | sensor | speed, configurable unit (B/s, KiB/s, kB/s, MiB/s, MB/s) |
+| sing-box Uplink / Downlink | sensor | data rate (B/s); pick the display unit in the entity settings (KiB/s, kB/s, MiB/s, MB/s) |
 | sing-box Uplink total / Downlink total | sensor | session totals |
-| sing-box \<proxy tag\> Ping | sensor | last url-test delay (ms) of each proxy; updates whenever sing-box runs a url-test |
-| sing-box \<group tag\> | select | one per selector outbound group |
+| sing-box \<proxy tag\> Ping | sensor | last url-test delay (ms) of each proxy; diagnostic entity, one per outbound |
+| sing-box \<group tag\> | select | one per selector outbound group (url-test / fallback groups are automatic and cannot be switched) |
 | sing-box Clash mode | select | only when the clash API is enabled |
 
 On the clash API backend the entities that cannot be provided (goroutines,
@@ -146,13 +150,20 @@ multiple sing-box instances are configured.
 | Service | Fields | Description |
 |---|---|---|
 | `singbox.select_outbound` | `group_tag`, `outbound_tag` | Select an outbound inside a group |
-| `singbox.url_test` | `outbound_tag` | Trigger a URL test for a group |
+| `singbox.url_test` | `outbound_tag`, `url` | Trigger a URL test for a group (`url` is used by the clash backend only) |
 | `singbox.set_group_expand` | `group_tag`, `is_expand` | Expand/collapse a group (gRPC backend only) |
 | `singbox.close_connection` | `connection_id` | Close one connection |
 | `singbox.close_all_connections` | – | Close all connections |
 | `singbox.set_clash_mode` | `mode` | Switch clash mode |
 
 ## Development
+
+Run the test suite (Home Assistant test harness, no sing-box needed):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements_test.txt
+.venv/bin/python -m pytest tests
+```
 
 Run the end-to-end smoke test against a local sing-box with both backends:
 
@@ -162,10 +173,11 @@ python3 scripts/smoke_test.py --host 127.0.0.1 --port 9090 \
     --clash-port 9091 --secret your-secret
 ```
 
-Run the offline regression suite (needs only `aiohttp`, no sing-box):
+Run the offline regression suites (need only `aiohttp`, no sing-box):
 
 ```bash
-python3 scripts/test_memory_leak_fix.py
+python3 scripts/test_memory_leak_fix.py   # WebSocket shutdown OOM (0.3.13)
+python3 scripts/test_regressions.py       # cyclic now-chain, protobuf decoding
 ```
 
 It reproduces the shutdown OOM fixed in 0.3.13: a WebSocket abort without a
@@ -173,38 +185,18 @@ close frame sends `traffic_stream()` into a busy loop that allocates millions
 of timers, so the pre-fix code is spun up in a subprocess and must fail to
 exit, while the shipped code must raise `ConnectionError` immediately.
 
-## Publishing to HACS
+## Recorder
 
-This repository is distributed through HACS. The following requirements must
-be met for it to be listed and updated correctly:
+The integration creates one ping sensor per outbound. With many proxies that
+is a lot of state to write on every url-test; exclude them from the recorder
+to keep the database small:
 
-- **Public repository** — the repository must be public on GitHub.
-- **Description** — the *About/Description* field in the GitHub repository
-  settings must be filled in; this text is displayed in the HACS UI.
-- **Topics** — relevant tags must be added; they are not visible in the UI but
-  are used by HACS's internal search.
-- **README.md** — must exist and contain installation and configuration
-  instructions.
-- **GitHub Releases** — HACS resolves versions from the tags of published
-  releases (Publish release). Creating a tag alone is not enough; a full
-  release must be published.
-- **hacs.json** — the manifest in the repository root specifies `name`
-  (display name), `filename` (where applicable), and the minimum required Home
-  Assistant (`homeassistant`) and HACS (`hacs`) versions.
-
-Additional requirements depend on the repository type:
-
-- **Integrations** — a `brand` folder inside the integration directory
-  (`custom_components/<domain>/brand/`) with at least an `icon.png` is
-  required, and the integration must follow the Home Assistant
-  `custom_components` development standards.
-- **Plugins (Lovelace) / Themes** — files must live in the directories HACS
-  expects (e.g. `/www/community/`); `hacs.json` must correctly set
-  `content_in_root` or `filename`.
-- **Validation (recommended)** — add the [HACS GitHub Action]
-  (https://hacs.xyz/docs/publish/action/) (`.github/workflows/validate.yaml`)
-  to automatically check the repository against the HACS standards on every
-  push and release.
+```yaml
+recorder:
+  exclude:
+    entity_globs:
+      - sensor.sing_box_ping_*
+```
 
 ## Disclaimer
 

@@ -11,6 +11,13 @@
           "ssl": "Use TLS (https)",
           "update_interval": "Status update interval"
         }
+      },
+      "reauth_confirm": {
+        "title": "[%key:common::config_flow::title::reauth%]",
+        "data": {
+          "password": "API secret"
+        },
+        "description": "The sing-box API rejected the configured secret. Update it to reconnect."
       }
     },
     "error": {
@@ -18,7 +25,8 @@
       "invalid_auth": "Invalid API secret. Check the secret configured in the sing-box api service."
     },
     "abort": {
-      "already_configured": "This sing-box instance is already configured."
+      "already_configured": "This sing-box instance is already configured.",
+      "reauth_successful": "Authentication was successful"
     }
   },
   "options": {

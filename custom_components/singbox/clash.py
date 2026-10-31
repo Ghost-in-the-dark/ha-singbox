@@ -29,11 +29,13 @@ import asyncio
 import inspect
 import json
 import logging
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import aiohttp
 
-from .grpc import SingBoxGroup, SingBoxGroupItem
+from .errors import SingBoxAuthError, SingBoxError, SingBoxNotSupported
+from .grpc import GRPC_STATUS_UNAUTHENTICATED, SingBoxGroup, SingBoxGroupItem
 
 _LOGGER = logging.getLogger(__package__)
 
@@ -44,44 +46,74 @@ _URL_TEST_TIMEOUT_MS = 5000
 _WS_IDLE_TIMEOUT = 45.0
 # aiohttp gained the receive(timeout=...) argument in 3.10; older releases
 # (still shipped by some Home Assistant builds) need an explicit wait_for.
-_WS_RECEIVE_TIMEOUT_ARG = "timeout" in inspect.signature(
-    aiohttp.ClientWebSocketResponse.receive
-).parameters
+_WS_RECEIVE_TIMEOUT_ARG = (
+    "timeout" in inspect.signature(aiohttp.ClientWebSocketResponse.receive).parameters
+)
 # The polling loop refreshes groups/config/connection totals on this cadence.
 POLL_INTERVAL_SECONDS = 5
+
+# Group types the clash API lets the user switch with PUT /proxies/{group}/.
+# sing-box accepts that call only for *group.Selector: urltest and fallback
+# groups answer HTTP 400 "Must be a Selector". Creating select entities for
+# them made every switch from Home Assistant / the panel card fail.
+_SELECTABLE_GROUP_TYPES = frozenset({"Selector"})
+
+
+# Guards the "now" walk in _last_url_test_delay. A selector may point at a
+# group that points back at it; without a bound the walk recursed until
+# Python raised RecursionError, which made every /proxies poll fail.
+_MAX_NOW_DEPTH = 32
 
 
 def _last_url_test_delay(info: dict, all_proxies: dict) -> tuple[int, int]:
     """Return (delay_ms, time_ms) of the newest history entry of a proxy.
 
     Falls back to the currently selected proxy for groups whose own history
-    is empty (Selector groups never record one; UrlTest groups do).
+    is empty (Selector groups never record one; UrlTest groups do). The walk
+    is iterative and keeps a "seen" set, so cyclic or dangling "now" chains
+    return (0, 0) instead of recursing forever.
     """
-    history = info.get("history")
-    if isinstance(history, list):
-        for entry in reversed(history):
-            if not isinstance(entry, dict):
-                continue
-            delay = entry.get("delay")
-            if isinstance(delay, int) and delay > 0:
-                tested_at = entry.get("time")
-                return delay, tested_at if isinstance(tested_at, int) else 0
-    now = info.get("now")
-    if isinstance(now, str):
+    seen: set[str] = set()
+    current = info
+    for _ in range(_MAX_NOW_DEPTH):
+        history = current.get("history")
+        if isinstance(history, list):
+            for entry in reversed(history):
+                if not isinstance(entry, dict):
+                    continue
+                delay = entry.get("delay")
+                if isinstance(delay, int) and delay > 0:
+                    tested_at = entry.get("time")
+                    return delay, tested_at if isinstance(tested_at, int) else 0
+        now = current.get("now")
+        if not isinstance(now, str) or now in seen:
+            return 0, 0
+        seen.add(now)
         target = all_proxies.get(now)
-        if isinstance(target, dict) and target is not info:
-            delay, tested_at = _last_url_test_delay(target, all_proxies)
-            if delay:
-                return delay, tested_at
+        if not isinstance(target, dict) or target is current:
+            return 0, 0
+        current = target
     return 0, 0
 
 
-class ClashApiError(Exception):
+class ClashApiError(SingBoxError):
     """A clash API call failed with a non-success status."""
 
     def __init__(self, status: int, message: str) -> None:
         super().__init__(f"clash API HTTP {status}: {message}")
         self.status = status
+
+
+class ClashApiAuthError(ClashApiError, SingBoxAuthError):
+    """The clash API rejected the configured secret (HTTP 401)."""
+
+
+def is_auth_error(err: BaseException) -> bool:
+    """True when the error means "the configured secret is wrong"."""
+    return isinstance(err, SingBoxAuthError) or getattr(err, "status", 0) in (
+        401,
+        GRPC_STATUS_UNAUTHENTICATED,
+    )
 
 
 class ClashClient:
@@ -119,7 +151,7 @@ class ClashClient:
                 # sing-box's ws server never answers the close handshake, so
                 # bound the wait or shutdown would stall for seconds.
                 await asyncio.wait_for(ws.close(), timeout=2)
-            except (asyncio.TimeoutError, ConnectionError, OSError):
+            except (TimeoutError, ConnectionError, OSError):
                 pass
         self._ws.clear()
         if self._own_session and self._session is not None:
@@ -189,6 +221,13 @@ class ClashClient:
         element holds the last url-test delay (ms) sing-box measured for it.
         Selector/UrlTest groups with an empty history report the delay of
         their currently selected proxy instead.
+
+        Only ``Selector`` groups are returned as switchable groups: the clash
+        API rejects PUT /proxies/{group}/ for urltest and fallback groups with
+        HTTP 400 "Must be a Selector" (sing-box 1.11 through testing), so
+        exposing them as select entities produced entities that could never
+        be changed. Their members are still reported as proxies so ping
+        sensors keep working, and the group itself keeps its own ping entry.
         """
         data = await self._json("GET", "/proxies")
         if not isinstance(data, dict):
@@ -217,10 +256,11 @@ class ClashClient:
                     url_test_delay=delay,
                 )
             )
-            if (
-                info.get("type") == "Selector"
-                and isinstance(info.get("all"), list)
-            ):
+            group_type = info.get("type", "")
+            # Only Selector groups can be switched (see _SELECTABLE_GROUP_TYPES).
+            # URLTest/Fallback groups still contribute their members as proxies
+            # (for ping sensors), but they get no select entity.
+            if group_type in _SELECTABLE_GROUP_TYPES and isinstance(info.get("all"), list):
                 items = [
                     SingBoxGroupItem(tag=tag, type="", url_test_time=0, url_test_delay=0)
                     for tag in info["all"]
@@ -229,7 +269,7 @@ class ClashClient:
                 groups.append(
                     SingBoxGroup(
                         tag=name,
-                        type="Selector",
+                        type=group_type,
                         selectable=True,
                         selected=info.get("now", ""),
                         is_expand=False,
@@ -260,7 +300,7 @@ class ClashClient:
         await self._json("PUT", "/configs", json_body={"mode": mode})
 
     async def url_test(self, outbound_tag: str, url: str | None = None) -> None:
-        await self._json(
+        data = await self._json(
             "GET",
             f"/proxies/{outbound_tag}/delay",
             params={
@@ -268,6 +308,14 @@ class ClashClient:
                 "timeout": str(_URL_TEST_TIMEOUT_MS),
             },
         )
+        # sing-box answers 200 with {"delay": 0} when the test fails, which the
+        # service used to swallow as a success.
+        if isinstance(data, dict) and isinstance(data.get("delay"), int):
+            if data["delay"] <= 0:
+                raise ClashApiError(200, f"url test for {outbound_tag} failed")
+
+    async def set_group_expand(self, group_tag: str, is_expand: bool) -> None:
+        raise SingBoxNotSupported("expanding a group is not supported by the clash API backend")
 
     async def close_connection(self, connection_id: str) -> None:
         await self._json("DELETE", f"/connections/{connection_id}")
@@ -280,13 +328,9 @@ class ClashClient:
     async def _open_ws(self, path: str) -> aiohttp.ClientWebSocketResponse:
         session = await self._request_session()
         try:
-            ws = await session.ws_connect(
-                self._url(path), headers=self._headers(), timeout=10
-            )
+            ws = await session.ws_connect(self._url(path), headers=self._headers(), timeout=10)
         except aiohttp.ClientError as err:
-            raise ConnectionError(
-                f"cannot open clash API stream {path}: {err}"
-            ) from err
+            raise ConnectionError(f"cannot open clash API stream {path}: {err}") from err
         self._ws.append(ws)
         return ws
 
@@ -320,7 +364,7 @@ class ClashClient:
             while True:
                 try:
                     msg = await self._ws_receive(ws)
-                except asyncio.TimeoutError as err:
+                except TimeoutError as err:
                     raise ConnectionError("traffic stream idle timeout") from err
                 if msg.type is not aiohttp.WSMsgType.TEXT:
                     # CLOSE / CLOSING / CLOSED / ERROR / BINARY: all terminal.
@@ -339,5 +383,5 @@ class ClashClient:
                 self._ws.remove(ws)
             try:
                 await asyncio.wait_for(ws.close(), timeout=2)
-            except (asyncio.TimeoutError, ConnectionError, OSError):
+            except (TimeoutError, ConnectionError, OSError):
                 pass

@@ -2,6 +2,6 @@
   "name": "sing-box",
   "content_in_root": false,
   "render_readme": true,
-  "homeassistant": "2024.6.0",
+  "homeassistant": "2024.11.0",
   "hacs": "1.32"
 }
