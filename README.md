@@ -148,8 +148,10 @@ type: custom:singbox-panel-card
 
 The card source lives in the separate
 [ha-singbox-panel](https://github.com/Ghost-in-the-dark/ha-singbox-panel)
-repository, which remains available for HACS users who prefer the
-standalone plugin.
+repository, but it is **not** published to the HACS default store — the
+bundled copy is the supported way to get the card. The standalone repository
+is only for following the card's own development, or for installing it through
+HACS as a custom repository.
 
 ## Services
 
