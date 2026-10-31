@@ -135,12 +135,21 @@ Ping sensors report the last delay sing-box itself measured during a url-test
 (group auto-tests on their configured interval, or via the `singbox.url_test`
 service) — the integration never probes the network on its own.
 
-## Companion card
+## Panel card (bundled)
 
-Turn these entities into a ready-made dashboard with the
-[Sing-box Panel Card](https://github.com/Ghost-in-the-dark/ha-singbox-panel)
-— a Lovelace card (installable via HACS) showing live speeds, traffic totals,
-per-proxy pings and one-click proxy switching.
+The integration ships a Lovelace card showing live speeds, traffic totals,
+per-proxy pings and one-click proxy switching. It is served from the
+integration itself and loaded automatically, so no manual resource entry is
+needed — just add a card:
+
+```yaml
+type: custom:singbox-panel-card
+```
+
+The card source lives in the separate
+[ha-singbox-panel](https://github.com/Ghost-in-the-dark/ha-singbox-panel)
+repository, which remains available for HACS users who prefer the
+standalone plugin.
 
 ## Services
 

@@ -34,6 +34,7 @@ from .const import (
 )
 from .coordinator import SingBoxCoordinator
 from .errors import SingBoxAuthError, SingBoxNotSupported
+from .frontend import async_register_card, async_unregister_card
 from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
 
 _LOGGER = logging.getLogger(__package__)
@@ -53,6 +54,28 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+def _translate_setup_error(err: Exception) -> Exception:
+    """Map a setup failure to the exception Home Assistant understands.
+
+    ConfigEntryAuthFailed triggers the reauth flow, ConfigEntryNotReady asks
+    Home Assistant to retry with backoff. Anything else stays as-is so a real
+    bug is not silently retried forever.
+    """
+    if isinstance(err, SingBoxAuthError):
+        return ConfigEntryAuthFailed(f"sing-box API authentication failed: {err}")
+    if isinstance(err, GrpcError):
+        if err.status == GRPC_STATUS_UNAUTHENTICATED:
+            return ConfigEntryAuthFailed(f"sing-box API authentication failed: {err}")
+        return ConfigEntryNotReady(f"sing-box API error: {err}")
+    if isinstance(err, ClashApiError):
+        if err.status == 401 or is_auth_error(err):
+            return ConfigEntryAuthFailed(f"sing-box clash API authentication failed: {err}")
+        return ConfigEntryNotReady(f"sing-box clash API error: {err}")
+    if isinstance(err, (OSError, ConnectionError, TimeoutError)):
+        return ConfigEntryNotReady(f"cannot reach sing-box API: {err}")
+    return err
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a sing-box config entry."""
     # Options (set via the options flow) override the initial data.
@@ -67,30 +90,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
     session = async_get_clientsession(hass)
-    client, backend = await detect_backend(host, port, secret, use_tls, session)
-    coordinator = SingBoxCoordinator(
-        hass, entry, client, backend, update_interval_seconds=update_interval
-    )
+    # Backend detection must run inside the try block: it performs the first
+    # network call, so an unreachable host or a wrong secret surfaces here
+    # (not in coordinator.async_setup). Escaping as a raw error left the
+    # entry in a failed state that Home Assistant never retried and never
+    # offered to re-authenticate.
+    coordinator: SingBoxCoordinator | None = None
     try:
+        client, backend = await detect_backend(host, port, secret, use_tls, session)
+        coordinator = SingBoxCoordinator(
+            hass, entry, client, backend, update_interval_seconds=update_interval
+        )
         await coordinator.async_setup()
-    except SingBoxAuthError as err:
-        await coordinator.async_shutdown()
-        raise ConfigEntryAuthFailed(f"sing-box API authentication failed: {err}") from err
-    except GrpcError as err:
-        await coordinator.async_shutdown()
-        if err.status == GRPC_STATUS_UNAUTHENTICATED:
-            raise ConfigEntryAuthFailed(f"sing-box API authentication failed: {err}") from err
-        raise ConfigEntryNotReady(f"sing-box API error: {err}") from err
-    except ClashApiError as err:
-        await coordinator.async_shutdown()
-        if err.status == 401:
-            raise ConfigEntryAuthFailed(f"sing-box clash API authentication failed: {err}") from err
-        raise ConfigEntryNotReady(f"sing-box clash API error: {err}") from err
-    except (OSError, ConnectionError) as err:
-        await coordinator.async_shutdown()
-        raise ConfigEntryNotReady(f"cannot reach sing-box API: {err}") from err
+    except Exception as err:
+        # Never leak a half-initialised coordinator (streams, backend session).
+        if coordinator is not None:
+            await coordinator.async_shutdown()
+        raise _translate_setup_error(err) from err
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
+    # Ship the Lovelace card with the integration: HACS reviewers require a
+    # card that depends 1:1 on the integration to live inside it.
+    await async_register_card(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await _async_setup_services(hass, entry)
     # Reload the integration when options (host/port/secret/interval) change.
@@ -100,7 +121,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload the entry after its options were updated."""
-    await hass.config_entries.async_reload_entry(entry)
+    # ConfigEntries exposes async_reload(entry_id); async_reload_entry() does
+    # not exist, so saving the options raised AttributeError inside the update
+    # listener and the entry was never reloaded.
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -111,7 +135,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_shutdown()
         if not any(isinstance(item, SingBoxCoordinator) for item in hass.data[DOMAIN].values()):
             # The services resolve their coordinator from hass.data, so they
-            # must not outlive the last entry.
+            # must not outlive the last entry. The bundled card is likewise
+            # only loaded while the integration has an entry.
+            async_unregister_card(hass)
             for name in SERVICE_NAMES:
                 if hass.services.has_service(DOMAIN, name):
                     hass.services.async_remove(DOMAIN, name)

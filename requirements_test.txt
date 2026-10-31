@@ -1,3 +1,9 @@
-pytest
-aiohttp
-pytest-homeassistant-custom-component
+# Pinned so CI resolves the same tree that passes locally. Without the
+# pytest-homeassistant-custom-component pin pip backtracks for minutes and
+# then fails building an sdist ("Cannot import 'setuptools.build_meta'").
+pytest-homeassistant-custom-component==0.13.316
+pytest==9.0.0
+aiohttp==3.13.3
+# The integration registers its bundled Lovelace card through the frontend
+# component, so tests need the frontend package Home Assistant ships with.
+home-assistant-frontend==20260128.6

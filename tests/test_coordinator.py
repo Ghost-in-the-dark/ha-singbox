@@ -6,6 +6,7 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
@@ -291,3 +292,79 @@ async def test_set_group_expand_unsupported_on_clash(hass: HomeAssistant) -> Non
     coordinator = SingBoxCoordinator(hass, entry, AsyncMock(), BACKEND_CLASH, 5)
     with pytest.raises(SingBoxNotSupported):
         await coordinator.set_group_expand("g", True)
+
+
+# -- bundled panel card ------------------------------------------------------
+
+
+async def test_bundled_card_is_served_and_loaded(hass: HomeAssistant) -> None:
+    """The bundled Lovelace card ships with the integration and is registered."""
+    from homeassistant.components.frontend import DATA_EXTRA_MODULE_URL
+
+    from custom_components.singbox.frontend import CARD_URL_PATH, card_path
+
+    assert card_path().is_file(), "the panel card bundle must ship with the integration"
+
+    entry = _entry("card")
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.singbox.detect_backend",
+        new=AsyncMock(return_value=(FakeGrpcClient(), BACKEND_GRPC)),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert CARD_URL_PATH in hass.data[DATA_EXTRA_MODULE_URL].urls
+
+
+# -- setup error mapping -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_state"),
+    [
+        (GrpcError(GRPC_STATUS_UNAUTHENTICATED, "bad secret"), ConfigEntryState.SETUP_ERROR),
+        (GrpcError(13, "boom"), ConfigEntryState.SETUP_RETRY),
+        (ClashApiError(401, "Unauthorized"), ConfigEntryState.SETUP_ERROR),
+        (ConnectionError("refused"), ConfigEntryState.SETUP_RETRY),
+        (TimeoutError("slow"), ConfigEntryState.SETUP_RETRY),
+    ],
+)
+async def test_setup_maps_errors(
+    hass: HomeAssistant, error: Exception, expected_state: ConfigEntryState
+) -> None:
+    """A bad secret fails the entry (reauth), an unreachable host just retries."""
+    entry = _entry(f"err_{type(error).__name__}")
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.singbox.detect_backend",
+        new=AsyncMock(side_effect=error),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is expected_state
+
+
+async def test_card_registration_is_idempotent(hass: HomeAssistant) -> None:
+    """Reloading the entry must not register the static route twice."""
+    from homeassistant.components.frontend import DATA_EXTRA_MODULE_URL
+
+    from custom_components.singbox.frontend import CARD_URL_PATH
+
+    entry = _entry("card2")
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.singbox.detect_backend",
+        new=AsyncMock(return_value=(FakeGrpcClient(), BACKEND_GRPC)),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert CARD_URL_PATH in hass.data[DATA_EXTRA_MODULE_URL].urls
+
+        # A reload unloads (removing the URL) and sets up again.
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert CARD_URL_PATH in hass.data[DATA_EXTRA_MODULE_URL].urls
