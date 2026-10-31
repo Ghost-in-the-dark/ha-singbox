@@ -26,6 +26,7 @@ Only aiohttp is used, which ships with Home Assistant.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Any, AsyncIterator
@@ -41,6 +42,11 @@ DEFAULT_URL_TEST_URL = "https://www.gstatic.com/generate_204"
 _URL_TEST_TIMEOUT_MS = 5000
 # If no WebSocket frame arrives for this long the stream is considered dead.
 _WS_IDLE_TIMEOUT = 45.0
+# aiohttp gained the receive(timeout=...) argument in 3.10; older releases
+# (still shipped by some Home Assistant builds) need an explicit wait_for.
+_WS_RECEIVE_TIMEOUT_ARG = "timeout" in inspect.signature(
+    aiohttp.ClientWebSocketResponse.receive
+).parameters
 # The polling loop refreshes groups/config/connection totals on this cadence.
 POLL_INTERVAL_SECONDS = 5
 
@@ -284,23 +290,49 @@ class ClashClient:
         self._ws.append(ws)
         return ws
 
+    async def _ws_receive(self, ws: aiohttp.ClientWebSocketResponse):
+        """Receive one WebSocket frame with a bounded wait.
+
+        The idle timeout is enforced by aiohttp itself instead of an extra
+        asyncio.wait_for() wrapper: the wrapper allocated a TimerHandle and a
+        Context on *every* frame, and it could never fire once the event loop
+        was starved by the busy loop described in traffic_stream().
+        """
+        if _WS_RECEIVE_TIMEOUT_ARG:
+            return await ws.receive(timeout=_WS_IDLE_TIMEOUT)
+        return await asyncio.wait_for(ws.receive(), timeout=_WS_IDLE_TIMEOUT)
+
     async def traffic_stream(self) -> AsyncIterator[tuple[int, int]]:
-        """Yield (up, down) byte deltas per second from the WS /traffic stream."""
+        """Yield (up, down) byte deltas per second from the WS /traffic stream.
+
+        Any frame that is not TEXT terminates the stream. aiohttp answers
+        WSMsgType.CLOSED when the TCP transport is aborted without a close
+        frame (exactly what happens when sing-box dies during HA shutdown);
+        receive() then returns immediately from the dead socket, so treating
+        non-TEXT frames as 'continue' spun this loop at ~170 000 iterations/s,
+        allocating millions of asyncio.wait_for timers until the kernel
+        OOM-killed Home Assistant. Re-entering receive() on a closed socket is
+        never useful, so every non-TEXT frame is terminal here and the
+        coordinator reconnects through its own backoff.
+        """
         ws = await self._open_ws("/traffic")
         try:
             while True:
                 try:
-                    msg = await asyncio.wait_for(ws.receive(), timeout=_WS_IDLE_TIMEOUT)
+                    msg = await self._ws_receive(ws)
                 except asyncio.TimeoutError as err:
                     raise ConnectionError("traffic stream idle timeout") from err
-                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                    raise ConnectionError(f"traffic stream closed: {msg.type}")
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
+                if msg.type is not aiohttp.WSMsgType.TEXT:
+                    # CLOSE / CLOSING / CLOSED / ERROR / BINARY: all terminal.
+                    raise ConnectionError(
+                        f"traffic stream ended: {getattr(msg.type, 'name', msg.type)}"
+                    )
                 try:
                     data = json.loads(msg.data)
                 except ValueError as err:
                     raise ClashApiError(200, f"invalid traffic frame: {err}") from err
+                if not isinstance(data, dict):
+                    raise ClashApiError(200, "invalid traffic frame: not an object")
                 yield int(data.get("up", 0)), int(data.get("down", 0))
         finally:
             if ws in self._ws:

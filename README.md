@@ -162,6 +162,17 @@ python3 scripts/smoke_test.py --host 127.0.0.1 --port 9090 \
     --clash-port 9091 --secret your-secret
 ```
 
+Run the offline regression suite (needs only `aiohttp`, no sing-box):
+
+```bash
+python3 scripts/test_memory_leak_fix.py
+```
+
+It reproduces the shutdown OOM fixed in 0.3.13: a WebSocket abort without a
+close frame sends `traffic_stream()` into a busy loop that allocates millions
+of timers, so the pre-fix code is spun up in a subprocess and must fail to
+exit, while the shipped code must raise `ConnectionError` immediately.
+
 ## Publishing to HACS
 
 This repository is distributed through HACS. The following requirements must

@@ -69,6 +69,9 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self._last_push_ts = 0.0
         self.clash_mode_available = False
         self._groups_ready = asyncio.Event()
+        # Set when the entry is unloaded, so streams can stop waiting out a
+        # reconnect backoff while Home Assistant is shutting down.
+        self._shutdown = asyncio.Event()
         # SubscribeStatus interval is a Go time.Duration, i.e. nanoseconds.
         self._interval_seconds = update_interval_seconds
         self._interval_ns = update_interval_seconds * 1_000_000_000
@@ -133,14 +136,37 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         ]
 
     async def async_shutdown(self) -> None:
-        """Cancel the backend streams."""
-        for task in self._stream_tasks:
-            task.cancel()
-        await asyncio.gather(*self._stream_tasks, return_exceptions=True)
-        self._stream_tasks.clear()
+        """Cancel the backend streams and close the API session."""
+        self._shutdown.set()
+        if self._stream_tasks:
+            for task in self._stream_tasks:
+                task.cancel()
+            # Bounded: a wedged task must not stall the config-entry unload
+            # (and with it the whole HA shutdown) for another minute.
+            done, pending = await asyncio.wait(self._stream_tasks, timeout=5)
+            if pending:
+                _LOGGER.warning("sing-box stream tasks ignored cancellation")
+            self._stream_tasks.clear()
         await self.client.close()
 
     # -- streams ------------------------------------------------------------
+
+    async def _pause(self, delay: float) -> bool:
+        """Wait before the next reconnect attempt.
+
+        Returns False as soon as a shutdown was requested, so the stream tasks
+        end immediately instead of waiting out the whole backoff (up to a
+        minute) while Home Assistant is stopping.
+        """
+        if delay <= 0:
+            return True
+        try:
+            await asyncio.wait_for(
+                self._shutdown.wait(), timeout=max(delay, _MIN_BACKOFF)
+            )
+        except asyncio.TimeoutError:
+            return True
+        return False
 
     async def _run_grpc_status_stream(self) -> None:
         backoff = _MIN_BACKOFF
@@ -160,7 +186,8 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             except (asyncio.TimeoutError, OSError, ConnectionError) as err:
                 _LOGGER.warning("status stream lost: %s", err)
             self._mark_unavailable(None)
-            await asyncio.sleep(backoff)
+            if not await self._pause(backoff):
+                return
             backoff = min(backoff * 2, _MAX_BACKOFF)
 
     async def _run_groups_stream(self) -> None:
@@ -183,7 +210,8 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             except (asyncio.TimeoutError, OSError, ConnectionError) as err:
                 _LOGGER.warning("groups stream lost: %s", err)
             self._mark_unavailable(None)
-            await asyncio.sleep(backoff)
+            if not await self._pause(backoff):
+                return
             backoff = min(backoff * 2, _MAX_BACKOFF)
 
     async def _run_clash_traffic_stream(self) -> None:
@@ -204,7 +232,8 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             except Exception as err:  # noqa: BLE001 - keep the stream alive
                 _LOGGER.exception("traffic stream crashed: %s", err)
             self._mark_unavailable(None)
-            await asyncio.sleep(backoff)
+            if not await self._pause(backoff):
+                return
             backoff = min(backoff * 2, _MAX_BACKOFF)
 
     async def _run_clash_poll_loop(self) -> None:
@@ -225,22 +254,26 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             except (ClashApiError, asyncio.TimeoutError, OSError, ConnectionError) as err:
                 _LOGGER.warning("clash poll failed: %s", err)
                 self._mark_unavailable(None)
-                await asyncio.sleep(backoff)
+                if not await self._pause(backoff):
+                    return
                 backoff = min(backoff * 2, _MAX_BACKOFF)
                 continue
             except (ValueError, TypeError) as err:
                 _LOGGER.error("clash poll returned a malformed response: %s", err)
                 self._mark_unavailable(None)
-                await asyncio.sleep(backoff)
+                if not await self._pause(backoff):
+                    return
                 backoff = min(backoff * 2, _MAX_BACKOFF)
                 continue
             except Exception as err:  # noqa: BLE001 - keep the loop alive
                 _LOGGER.exception("clash poll loop crashed: %s", err)
                 self._mark_unavailable(None)
-                await asyncio.sleep(backoff)
+                if not await self._pause(backoff):
+                    return
                 backoff = min(backoff * 2, _MAX_BACKOFF)
                 continue
-            await asyncio.sleep(interval)
+            if not await self._pause(interval):
+                return
 
     async def _apply_clash_mode(self) -> None:
         try:
