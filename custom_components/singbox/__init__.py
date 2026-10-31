@@ -34,7 +34,7 @@ from .const import (
 )
 from .coordinator import SingBoxCoordinator
 from .errors import SingBoxAuthError, SingBoxNotSupported
-from .frontend import async_register_card, async_unregister_card
+from .frontend import async_register_card
 from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
 
 _LOGGER = logging.getLogger(__package__)
@@ -50,7 +50,17 @@ SERVICE_NAMES = (
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the sing-box component (config flow only)."""
+    """Set up the sing-box component.
+
+    The bundled Lovelace card is registered here, not in async_setup_entry:
+    the card has to be available as soon as the integration is installed,
+    even while a config entry is still failing (unreachable sing-box host,
+    missing secret). Registering it from async_setup_entry meant the card
+    silently disappeared whenever the entry did not reach LOADED, which is
+    exactly the `Custom element doesn't exist` case. The manifest declares
+    `http` and `frontend` as dependencies, so both are ready here.
+    """
+    await async_register_card(hass)
     return True
 
 
@@ -109,9 +119,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise _translate_setup_error(err) from err
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
-    # Ship the Lovelace card with the integration: HACS reviewers require a
-    # card that depends 1:1 on the integration to live inside it.
-    await async_register_card(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await _async_setup_services(hass, entry)
     # Reload the integration when options (host/port/secret/interval) change.
@@ -135,9 +142,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_shutdown()
         if not any(isinstance(item, SingBoxCoordinator) for item in hass.data[DOMAIN].values()):
             # The services resolve their coordinator from hass.data, so they
-            # must not outlive the last entry. The bundled card is likewise
-            # only loaded while the integration has an entry.
-            async_unregister_card(hass)
+            # must not outlive the last entry. The bundled card is deliberately
+            # NOT unregistered here: it is registered from async_setup, which
+            # runs once per process, so unloading (or reloading) an entry must
+            # not strand the dashboards with a missing element.
             for name in SERVICE_NAMES:
                 if hass.services.has_service(DOMAIN, name):
                     hass.services.async_remove(DOMAIN, name)
