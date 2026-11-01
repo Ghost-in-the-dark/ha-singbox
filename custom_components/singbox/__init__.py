@@ -11,11 +11,13 @@ from __future__ import annotations
 import logging
 
 import voluptuous as vol
+from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
+    ConfigEntryError,
     ConfigEntryNotReady,
     HomeAssistantError,
     ServiceValidationError,
@@ -38,6 +40,8 @@ from .frontend import async_register_card
 from .grpc import GRPC_STATUS_UNAUTHENTICATED, GrpcError
 
 _LOGGER = logging.getLogger(__package__)
+
+DATA_WS_REGISTERED = "singbox_websocket_registered"
 
 SERVICE_NAMES = (
     "select_outbound",
@@ -64,7 +68,89 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     `http` and `frontend` as dependencies, so both are ready here.
     """
     await async_register_card(hass)
+    _async_register_websocket_api(hass)
     return True
+
+
+def _async_register_websocket_api(hass: HomeAssistant) -> None:
+    """Register the panel card's data endpoints (idempotent).
+
+    Registered from async_setup rather than async_setup_entry so the card can
+    always talk to the integration, even while an entry is failing to load:
+    the UI then gets a clear answer instead of "unknown_command".
+    """
+    if hass.data.get(DATA_WS_REGISTERED):
+        return
+    websocket_api.async_register_command(hass, ws_connections)
+    hass.data[DATA_WS_REGISTERED] = True
+
+
+def _select_coordinator(hass: HomeAssistant, entry_id: str | None) -> SingBoxCoordinator:
+    """Resolve the coordinator for a websocket request.
+
+    An unknown or not-yet-loaded entry raises ConfigEntryError, which the
+    command turns into a "not found" error for the card.
+    """
+    coordinators: dict[str, SingBoxCoordinator] = hass.data.get(DOMAIN, {})
+    if entry_id is not None:
+        coordinator = coordinators.get(entry_id)
+        if coordinator is None:
+            raise ConfigEntryError(f"No sing-box config entry with id {entry_id}")
+        return coordinator
+    loaded = [item for item in coordinators.values() if isinstance(item, SingBoxCoordinator)]
+    if not loaded:
+        raise ConfigEntryError("No sing-box config entry is loaded")
+    return loaded[0]
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "singbox/connections",
+        vol.Optional("entry_id"): cv.string,
+    }
+)
+@websocket_api.async_response
+async def ws_connections(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return the live sing-box connections for the panel card.
+
+    Payload::
+
+        {
+          "connections": [
+            {"id": "...", "network": "tcp", "protocol": "https",
+             "source": "192.168.1.5:51234", "destination": "1.2.3.4:443",
+             "host": "example.com", "rule": "...", "outbound": "proxy",
+             "chain": ["proxy", "hk"], "process": "curl",
+             "upload": 1234, "download": 5678,
+             "upload_total": 100000, "download_total": 200000,
+             "created_at": 1730000000000}
+          ],
+          "count": 1,
+          "supported": true
+        }
+
+    ``supported`` is False when the backend cannot report connections at all
+    (connection tracking disabled, or an API without SubscribeConnections);
+    the card then shows a hint instead of an empty list.
+    """
+    try:
+        coordinator = _select_coordinator(hass, msg.get("entry_id"))
+    except ConfigEntryError as err:
+        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, str(err))
+        return
+    connections = [item.as_dict() for item in coordinator.connections]
+    connection.send_result(
+        msg["id"],
+        {
+            "connections": connections,
+            "count": len(connections),
+            "supported": coordinator.connections_supported,
+        },
+    )
 
 
 def _translate_setup_error(err: Exception) -> Exception:

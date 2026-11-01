@@ -32,8 +32,11 @@ from .const import DEFAULT_UPDATE_INTERVAL, DOMAIN
 from .errors import SingBoxAuthError, SingBoxNotSupported
 from .grpc import (
     GRPC_STATUS_NOT_FOUND,
+    GRPC_STATUS_UNIMPLEMENTED,
     GrpcError,
     SingBoxClient,
+    SingBoxConnection,
+    SingBoxConnectionUpdate,
     SingBoxGroup,
     SingBoxGroupItem,
     SingBoxStatus,
@@ -95,6 +98,11 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         # SubscribeStatus interval is a Go time.Duration, i.e. nanoseconds.
         self._interval_seconds = update_interval_seconds
         self._interval_ns = update_interval_seconds * 1_000_000_000
+        # The connection list is a per-second view ("what is open right now"),
+        # so it is pushed at a fixed 1 s cadence regardless of the configured
+        # sensor interval. The server clamps anything below that by itself;
+        # asking for it explicitly keeps the card's list fresh.
+        self._connections_interval_ns = 1_000_000_000
         # Traffic is accumulated between pushes so the reported speed is the
         # average over the real elapsed time, not a single 1s frame.
         self._rate_window_start = time.monotonic()
@@ -105,6 +113,14 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         # proxy up by tag used to be a linear scan per sensor per push.
         self._groups_index: dict[str, SingBoxGroup] = {}
         self._proxies_index: dict[str, SingBoxGroupItem] = {}
+        # Live connections, keyed by their sing-box id. The clash backend
+        # replaces the whole set on every poll, the gRPC backend applies the
+        # deltas of the SubscribeConnections stream.
+        self._connections: dict[str, SingBoxConnection] = {}
+        # False as soon as the backend says it cannot list connections at
+        # all (UNIMPLEMENTED / NOT_FOUND), so the websocket API can report
+        # "not supported" instead of an empty list.
+        self._connections_supported = True
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -147,6 +163,7 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self._stream_factories = [
             self._run_grpc_status_stream,
             self._run_groups_stream,
+            self._run_connections_stream,
         ]
 
     async def _setup_clash(self) -> None:
@@ -289,6 +306,25 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             return True
         return False
 
+    def _stop_if_unsupported(self, name: str, err: Exception) -> bool:
+        """Stop a stream the backend simply does not implement.
+
+        A backend without connection tracking answers UNIMPLEMENTED / NOT_FOUND
+        to SubscribeConnections. Retrying that forever would only fill the log
+        with backoff warnings, so the stream is retired and the websocket API
+        reports the feature as unsupported.
+        """
+        if not isinstance(err, GrpcError) or err.status not in (
+            GRPC_STATUS_UNIMPLEMENTED,
+            GRPC_STATUS_NOT_FOUND,
+        ):
+            return False
+        _LOGGER.info("sing-box %s stream is not available on this backend: %s", name, err)
+        if name == "connections":
+            self._connections_supported = False
+        self._mark_available()
+        return True
+
     async def _run_stream(self, name: str, stream, apply) -> None:
         """Consume one backend stream, reconnecting with backoff.
 
@@ -312,6 +348,8 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
                     if self.config_entry is not None:
                         self.config_entry.async_start_reauth(self.hass)
                     return
+                if self._stop_if_unsupported(name, err):
+                    return
                 _LOGGER.warning("sing-box %s stream lost: %s", name, err)
             self._mark_unavailable(None)
             if not await self._pause(backoff):
@@ -327,6 +365,15 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
 
     async def _run_groups_stream(self) -> None:
         await self._run_stream("groups", self.client.subscribe_groups, self._apply_groups)
+
+    async def _run_connections_stream(self) -> None:
+        if not self._connections_supported:
+            return
+        await self._run_stream(
+            "connections",
+            lambda: self.client.subscribe_connections(self._connections_interval_ns),
+            self._apply_connection_events,
+        )
 
     async def _run_clash_traffic_stream(self) -> None:
         await self._run_stream("traffic", self.client.traffic_stream, self._apply_traffic)
@@ -376,7 +423,13 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
 
     async def _apply_clash_connections(self) -> None:
         try:
-            n, memory, upload_total, download_total = await self.client.get_connections()
+            (
+                n,
+                memory,
+                upload_total,
+                download_total,
+                connections,
+            ) = await self.client.get_connections_snapshot()
         except (TimeoutError, ClashApiError, OSError, ConnectionError) as err:
             _LOGGER.warning("clash connections snapshot failed: %s", err)
             return
@@ -384,6 +437,9 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         self.data.memory = memory
         self.data.uplink_total = upload_total
         self.data.downlink_total = download_total
+        # A clash snapshot already is the complete set of live connections,
+        # so it replaces whatever was known instead of merging into it.
+        self._set_connections(connections)
 
     # -- snapshot updates ---------------------------------------------------
 
@@ -396,6 +452,25 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
 
     def _apply_groups(self, groups: list[SingBoxGroup]) -> None:
         self._set_groups(groups, flatten_proxies(groups))
+
+    def _set_connections(self, connections: list[SingBoxConnection]) -> None:
+        """Replace the live connection set with a full snapshot."""
+        self._connections = {
+            connection.id: connection for connection in connections if connection.id
+        }
+
+    def _apply_connection_events(self, update: SingBoxConnectionUpdate) -> None:
+        """Weld one SubscribeConnections frame into the live connection map."""
+        if update.reset:
+            self._connections = {}
+        for connection_id in update.closed_ids:
+            self._connections.pop(connection_id, None)
+        for connection in update.connections:
+            if connection.id:
+                self._connections[connection.id] = connection
+        # ``data.connections_in`` keeps coming from the SubscribeStatus frame
+        # (and from the clash snapshot): writing the map size here would make
+        # the sensor oscillate between two different numbers every second.
 
     def _apply_traffic(self, frame: tuple[int, int]) -> None:
         # The WS /traffic frame only carries per-second deltas; the running
@@ -462,6 +537,16 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
     def stream_tasks(self) -> list[asyncio.Task]:
         """The running backend stream tasks (for diagnostics)."""
         return list(self._stream_tasks)
+
+    @property
+    def connections_supported(self) -> bool:
+        """False when the backend cannot report the connection list at all."""
+        return self._connections_supported
+
+    @property
+    def connections(self) -> list[SingBoxConnection]:
+        """The live connections, in the order the backend reported them."""
+        return list(self._connections.values())
 
     @property
     def groups_index(self) -> dict[str, SingBoxGroup]:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import Any
 
 import aiohttp
 
@@ -102,6 +103,10 @@ def subscribe_status_request(interval_ns: int) -> bytes:
     return _field_varint(1, interval_ns)
 
 
+def subscribe_connections_request(interval_ns: int) -> bytes:
+    return _field_varint(1, interval_ns)
+
+
 def select_outbound_request(group_tag: str, outbound_tag: str) -> bytes:
     return _field_bytes(1, group_tag.encode()) + _field_bytes(2, outbound_tag.encode())
 
@@ -178,12 +183,199 @@ def _int(fields: dict[int, list[int | bytes]], num: int) -> int:
     return int.from_bytes(value[0], "little")
 
 
+def _int32(fields: dict[int, list[int | bytes]], num: int) -> int:
+    """Read a proto3 ``int32`` field, restoring the sign of negative values.
+
+    Negative int32 values are sign-extended to 64 bits on the wire (sing-box
+    sends ``userId = -1`` for "unknown"), so the unsigned varint decoder would
+    report 18446744073709551615 instead of -1. Encoders that emit only the low
+    32 bits are handled too.
+    """
+    value = _int(fields, num)
+    if value >= 1 << 63:
+        return value - (1 << 64)
+    if 1 << 31 <= value <= 0xFFFFFFFF:
+        return value - (1 << 32)
+    return value
+
+
 def _bool(fields: dict[int, list[int | bytes]], num: int) -> bool:
     return _int(fields, num) != 0
 
 
 def _str_list(fields: dict[int, list[int | bytes]], num: int) -> list[str]:
     return [v.decode() for v in fields.get(num, []) if isinstance(v, bytes)]
+
+
+# ---------------------------------------------------------------------------
+# connections
+# ---------------------------------------------------------------------------
+
+# Second field of ``ConnectionEvent`` (``ConnectionEventType``). The proto
+# encodes the two "gone" cases as a single CONNECTION_EVENT_CLOSED, but both
+# the clash snapshot and older builds may report a closed connection inline.
+CONNECTION_EVENT_NEW = 0
+CONNECTION_EVENT_UPDATE = 1
+CONNECTION_EVENT_CLOSED = 2
+
+
+@dataclass
+class SingBoxConnection:
+    """One tracked connection, as reported by either backend.
+
+    This is the single, backend-neutral shape used by the coordinator and by
+    the ``singbox/connections`` websocket command, so the bundled card never
+    has to care which API produced it. Field names are stable API: the
+    websocket command serialises them as-is with :meth:`SingBoxConnection.as_dict`.
+    """
+
+    # Stable sing-box connection id (a UUID string).
+    id: str = ""
+    # "tcp" or "udp".
+    network: str = ""
+    # Sniffed protocol (e.g. "https", "tls"), empty when not sniffed.
+    protocol: str = ""
+    # "1.2.3.4:12345" style source and destination endpoints.
+    source: str = ""
+    destination: str = ""
+    # Domain (or destination FQDN) the connection was made to.
+    host: str = ""
+    # Matched route rule and the outbound that handled the connection.
+    rule: str = ""
+    outbound: str = ""
+    # Outbound chain, outermost group first (["proxy", "hk"]).
+    chain: list[str] = field(default_factory=list)
+    # Process name/path that opened the connection, empty when unknown.
+    process: str = ""
+    # Traffic rates of the last interval, in bytes per second.
+    upload: int = 0
+    download: int = 0
+    # Cumulative traffic of the connection, in bytes.
+    upload_total: int = 0
+    download_total: int = 0
+    # Creation time, epoch milliseconds.
+    created_at: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the flat, snake_case payload used by the websocket API."""
+        return {
+            "id": self.id,
+            "network": self.network,
+            "protocol": self.protocol,
+            "source": self.source,
+            "destination": self.destination,
+            "host": self.host,
+            "rule": self.rule,
+            "outbound": self.outbound,
+            "chain": list(self.chain),
+            "process": self.process,
+            "upload": self.upload,
+            "download": self.download,
+            "upload_total": self.upload_total,
+            "download_total": self.download_total,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class SingBoxConnectionUpdate:
+    """One ``ConnectionEvents`` frame, decoded.
+
+    ``reset`` means the payload is the complete set of known connections and
+    whatever the coordinator holds must be dropped first. Otherwise every
+    event is a delta: NEW/UPDATE carry the current snapshot of a connection,
+    CLOSED only carries its id.
+    """
+
+    connections: list[SingBoxConnection] = field(default_factory=list)
+    closed_ids: list[str] = field(default_factory=list)
+    reset: bool = False
+
+
+def _parse_process_info(raw: bytes) -> str:
+    """Render a ``ProcessInfo`` as the single string the card displays.
+
+    Matches what the clash snapshot does: prefer the executable path, fall
+    back to the first Android package name, and append the user name/id when
+    sing-box knows one.
+    """
+    process = decode_fields(raw)
+    path = _str(process, 4)
+    if not path:
+        packages = _str_list(process, 5)
+        path = packages[0] if packages else ""
+    user = _str(process, 3)
+    if not user:
+        user_id = _int32(process, 2)
+        user = str(user_id) if user_id != -1 else ""
+    if path and user:
+        return f"{path} ({user})"
+    return path
+
+
+def _parse_connection(raw: bytes) -> SingBoxConnection:
+    fields = decode_fields(raw)
+    process = ""
+    for raw_process in fields.get(22, []):
+        if isinstance(raw_process, bytes):
+            process = _parse_process_info(raw_process)
+    return SingBoxConnection(
+        id=_str(fields, 1),
+        network=_str(fields, 5),
+        protocol=_str(fields, 9),
+        source=_str(fields, 6),
+        destination=_str(fields, 7),
+        host=_str(fields, 8),
+        rule=_str(fields, 18),
+        outbound=_str(fields, 19),
+        chain=_str_list(fields, 21),
+        process=process,
+        upload_total=_int(fields, 16),
+        download_total=_int(fields, 17),
+        created_at=_int(fields, 12),
+    )
+
+
+def parse_connection_events(payload: bytes) -> SingBoxConnectionUpdate:
+    """Decode a ``ConnectionEvents`` message.
+
+    ``ConnectionEvents{ repeated ConnectionEvent events = 1; bool reset = 2; }``
+    and ``ConnectionEvent{ type = 1; id = 2; connection = 3; uplinkDelta = 4;
+    downlinkDelta = 5; closedAt = 6; }``.
+
+    The deltas and the closing timestamp are dropped on purpose: the card
+    needs the byte counters and the two endpoints, and the deltas of a
+    subscription are only meaningful between two consecutive frames of the
+    same stream.
+    """
+    fields = decode_fields(payload)
+    update = SingBoxConnectionUpdate(reset=_bool(fields, 2))
+    for raw_event in fields.get(1, []):
+        if not isinstance(raw_event, bytes):
+            continue
+        event = decode_fields(raw_event)
+        event_id = _str(event, 2)
+        raw_connection = None
+        for candidate in event.get(3, []):
+            if isinstance(candidate, bytes):
+                raw_connection = candidate
+        if _int(event, 1) == CONNECTION_EVENT_CLOSED:
+            # A closed event may still carry the final snapshot of the
+            # connection; the id is what matters.
+            if event_id:
+                update.closed_ids.append(event_id)
+            continue
+        if raw_connection is None:
+            if not event_id:
+                continue
+            # UPDATE without a snapshot (only deltas): nothing to store, the
+            # coordinator already has the connection from its NEW event.
+            continue
+        connection = _parse_connection(raw_connection)
+        if not connection.id:
+            connection.id = event_id
+        update.connections.append(connection)
+    return update
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +640,19 @@ class SingBoxClient:
     async def subscribe_groups(self) -> AsyncIterator[list[SingBoxGroup]]:
         async for payload in self.stream("SubscribeGroups", empty_message()):
             yield _parse_groups(payload)
+
+    async def subscribe_connections(
+        self, interval_ns: int
+    ) -> AsyncIterator[SingBoxConnectionUpdate]:
+        """Stream connection events (new/update/closed, plus reset frames).
+
+        Only sing-box builds with connection tracking answer this RPC; the
+        others return UNIMPLEMENTED ("connection tracking not available").
+        """
+        async for payload in self.stream(
+            "SubscribeConnections", subscribe_connections_request(interval_ns)
+        ):
+            yield parse_connection_events(payload)
 
     async def select_outbound(self, group_tag: str, outbound_tag: str) -> None:
         await self.unary("SelectOutbound", select_outbound_request(group_tag, outbound_tag))

@@ -137,14 +137,48 @@ service) — the integration never probes the network on its own.
 
 ## Panel card (bundled)
 
-The integration ships a Lovelace card showing live speeds, traffic totals,
-per-proxy pings and one-click proxy switching. It is served from the
-integration itself and loaded automatically, so no manual resource entry is
-needed — just add a card:
+The integration ships a Lovelace card showing live speeds, a traffic chart,
+traffic totals, per-proxy pings, one-click proxy switching and the list of
+active connections. It is served from the integration itself and loaded
+automatically, so no manual resource entry is needed — just add a card:
 
 ```yaml
 type: custom:singbox-panel-card
 ```
+
+### What the card shows
+
+Every block can be turned on or off from the visual editor, or with the
+matching YAML keys (all default to `true`):
+
+| Key | Block |
+|---|---|
+| `show_speeds` | Current upload/download speed tiles |
+| `show_chart` | Traffic chart of the last five minutes |
+| `show_totals` | Total traffic, memory and connection count |
+| `show_groups` | Outbound groups and standalone outbounds |
+| `show_connections` | Active connections list with filtering |
+| `show_test_all` | The “Test all” button in the header |
+
+Further options:
+
+| Key | Default | Description |
+|---|---|---|
+| `title` | `Sing-box` | Card title |
+| `update_interval` | `0` | Seconds between re-renders; `0` = on every state push |
+| `language` | `auto` | `auto`, `ru` or `en` |
+| `exclude_outbounds` | `[]` | Outbound tags hidden from the card |
+| `device_id` / `entity` | – | Pin the card to one sing-box instance |
+
+The traffic chart is drawn from the live speed sensors, so it needs no
+recorder or history integration: the card keeps the last five minutes in
+memory while it is open.
+
+The connections list is fed by the `singbox/connections` WebSocket command.
+It supports free-text search (host, process, outbound, rule) plus network,
+protocol and outbound filters, and can close one connection or all of them.
+When the sing-box build does not expose connection tracking, the card says so
+instead of showing an empty list.
 
 The card source lives in the separate
 [ha-singbox-panel](https://github.com/Ghost-in-the-dark/ha-singbox-panel)

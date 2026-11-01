@@ -30,12 +30,18 @@ import inspect
 import json
 import logging
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 import aiohttp
 
 from .errors import SingBoxAuthError, SingBoxError, SingBoxNotSupported
-from .grpc import GRPC_STATUS_UNAUTHENTICATED, SingBoxGroup, SingBoxGroupItem
+from .grpc import (
+    GRPC_STATUS_UNAUTHENTICATED,
+    SingBoxConnection,
+    SingBoxGroup,
+    SingBoxGroupItem,
+)
 
 _LOGGER = logging.getLogger(__package__)
 
@@ -94,6 +100,101 @@ def _last_url_test_delay(info: dict, all_proxies: dict) -> tuple[int, int]:
             return 0, 0
         current = target
     return 0, 0
+
+
+def _endpoint(addr: object, port: object) -> str:
+    """Render a clash metadata address/port pair as "ip:port"."""
+    host = addr if isinstance(addr, str) else ""
+    if port is None or port == "":
+        return host
+    return f"{host}:{port}"
+
+
+def _parse_epoch_ms(value: object) -> int:
+    """Convert a clash ``start`` timestamp to epoch milliseconds.
+
+    sing-box marshals the Go ``time.Time`` as RFC 3339 with nanoseconds
+    ("2026-11-01T19:20:13.123456789+03:00"); classic clash builds send the
+    same string, while a few forks send a numeric Unix time instead.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        # Heuristic: seconds vs milliseconds.
+        number = float(value)
+        return int(number * 1000) if number < 1e11 else int(number)
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(value).timestamp() * 1000)
+    except ValueError:
+        pass
+    try:
+        return int(float(value) * 1000)
+    except ValueError:
+        return 0
+
+
+def _parse_clash_connection(raw: dict) -> SingBoxConnection:
+    """Flatten one ``/connections`` entry into the shared connection model.
+
+    The snapshot replaces the flat ``SingBoxConnection`` fields with a nested
+    ``metadata`` object and keeps the byte counters as totals; the card works
+    with the same flat shape for both backends, so everything is unpacked
+    here.
+    """
+    metadata = raw.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    chain = [item for item in raw.get("chains") or [] if isinstance(item, str)]
+    process = metadata.get("processPath") or metadata.get("process") or ""
+    upload_total = raw.get("upload")
+    download_total = raw.get("download")
+    return SingBoxConnection(
+        id=str(raw.get("id", "")),
+        network=str(metadata.get("network", "") or ""),
+        # The clash snapshot has no sniffed protocol field; ``type`` is the
+        # inbound type ("tun", "http/tun"), not a protocol.
+        protocol="",
+        source=_endpoint(metadata.get("sourceIP"), metadata.get("sourcePort")),
+        destination=_endpoint(metadata.get("destinationIP"), metadata.get("destinationPort")),
+        host=str(metadata.get("host") or metadata.get("domain") or ""),
+        rule=str(raw.get("rule", "") or ""),
+        # sing-box reports the chain outermost-group-first and the final
+        # outbound last, which is exactly what the card renders.
+        outbound=chain[-1] if chain else "",
+        chain=chain,
+        process=process if isinstance(process, str) else "",
+        upload_total=upload_total if isinstance(upload_total, int) else 0,
+        download_total=download_total if isinstance(download_total, int) else 0,
+        created_at=_parse_epoch_ms(raw.get("start")),
+    )
+
+
+def parse_connections_snapshot(
+    data: object,
+) -> tuple[list[SingBoxConnection], int, int, int]:
+    """Unpack a ``GET /connections/`` payload.
+
+    Returns (connections, memory, upload_total, download_total). A payload
+    without a usable ``connections`` array yields an empty list instead of
+    raising: older clash builds and sing-box forks answer slightly different
+    shapes, and a missing list must not take the poll loop down.
+    """
+    if not isinstance(data, dict):
+        raise ClashApiError(200, f"unexpected /connections response: {type(data).__name__}")
+    raw_connections = data.get("connections")
+    connections: list[SingBoxConnection] = []
+    if isinstance(raw_connections, list):
+        for raw in raw_connections:
+            if isinstance(raw, dict):
+                connections.append(_parse_clash_connection(raw))
+    return (
+        connections,
+        data.get("memory", 0) if isinstance(data.get("memory", 0), int) else 0,
+        data.get("uploadTotal", 0) if isinstance(data.get("uploadTotal", 0), int) else 0,
+        data.get("downloadTotal", 0) if isinstance(data.get("downloadTotal", 0), int) else 0,
+    )
 
 
 class ClashApiError(SingBoxError):
@@ -280,16 +381,21 @@ class ClashClient:
 
     async def get_connections(self) -> tuple[int, int, int, int]:
         """Return (active_connections, memory, upload_total, download_total)."""
+        snapshot = await self.get_connections_snapshot()
+        return snapshot[:4]  # type: ignore[return-value]
+
+    async def get_connections_snapshot(
+        self,
+    ) -> tuple[int, int, int, int, list[SingBoxConnection]]:
+        """Return (count, memory, upload_total, download_total, connections).
+
+        The connection list itself used to be thrown away here, which left the
+        card with nothing but a count. Parsing it costs the same single
+        ``GET /connections/`` round trip, so both are returned together.
+        """
         data = await self._json("GET", "/connections/")
-        if not isinstance(data, dict):
-            raise ClashApiError(200, f"unexpected /connections response: {type(data).__name__}")
-        connections = data.get("connections", [])
-        return (
-            len(connections) if isinstance(connections, list) else 0,
-            data.get("memory", 0),
-            data.get("uploadTotal", 0),
-            data.get("downloadTotal", 0),
-        )
+        connections, memory, upload_total, download_total = parse_connections_snapshot(data)
+        return len(connections), memory, upload_total, download_total, connections
 
     # -- control -------------------------------------------------------------
 
