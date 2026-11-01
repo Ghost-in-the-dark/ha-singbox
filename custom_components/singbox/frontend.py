@@ -34,6 +34,7 @@ integration, so every failure here is logged and swallowed.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,30 @@ DATA_CARD_REGISTERED = "singbox_card_registered"
 def card_path() -> Path:
     """Absolute path of the bundled card."""
     return Path(__file__).with_name("www") / CARD_FILENAME
+
+
+def _card_version() -> str:
+    """Version string used to bust the frontend module cache."""
+    try:
+        # The manifest version is what users see in HACS and in releases, and
+        # the bundle changes together with it — the right cache key.
+        manifest = Path(__file__).with_name("manifest.json")
+        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
+    except Exception:  # noqa: BLE001 - cache busting must never break setup
+        return ""
+
+
+def card_url() -> str:
+    """Resource URL for the bundled card, versioned to defeat module caching.
+
+    Lovelace imports the resource by URL and the browser then caches that
+    module forever: an upgraded bundle used to stay invisible until the user
+    cleared storage by hand (the card even kept reporting the old version in
+    its footer). A query string changes the URL per release, so the frontend
+    fetches the new bundle and the old entry is replaced in place.
+    """
+    version = _card_version()
+    return f"{CARD_URL_PATH}?v={version}" if version else CARD_URL_PATH
 
 
 async def async_register_card(hass: HomeAssistant) -> None:
@@ -88,7 +113,7 @@ async def async_register_card(hass: HomeAssistant) -> None:
     # fall back to the extra frontend module. It is unreliable on the legacy
     # build, but it is better than not loading the card at all.
     try:
-        add_extra_js_url(hass, CARD_URL_PATH)
+        add_extra_js_url(hass, card_url())
     except Exception:  # noqa: BLE001 - never break setup over the card
         _LOGGER.exception("Could not load the bundled panel card")
 
@@ -114,15 +139,36 @@ async def _async_register_lovelace_resource(hass: HomeAssistant) -> bool:
     if resources is None or not hasattr(resources, "async_create_item"):
         return False
 
+    url = card_url()
     try:
         if not getattr(resources, "loaded", False):
             await resources.async_load()
             resources.loaded = True
-        if any(item.get(CONF_URL) == CARD_URL_PATH for item in resources.async_items()):
+
+        items = resources.async_items()
+        if any(item.get(CONF_URL) == url for item in items):
             return True
-        await resources.async_create_item(
-            {CONF_RESOURCE_TYPE_WS: "module", CONF_URL: CARD_URL_PATH}
-        )
+
+        # An older release registered the bare URL. Point that entry at the
+        # versioned URL instead of adding a second one: two resources would
+        # both load the card, and the older one would win the registry race.
+        stale = [
+            item for item in items if str(item.get(CONF_URL, "")).split("?", 1)[0] == CARD_URL_PATH
+        ]
+        if stale and hasattr(resources, "async_update_item"):
+            await resources.async_update_item(
+                stale[0]["id"],
+                {CONF_RESOURCE_TYPE_WS: "module", CONF_URL: url},
+            )
+            _LOGGER.debug("Updated the Sing-box Panel Card resource to %s", url)
+            return True
+        if stale:
+            # Cannot update in place: drop the stale entry so the new one is
+            # the only copy.
+            for item in stale:
+                await resources.async_delete_item(item["id"])
+
+        await resources.async_create_item({CONF_RESOURCE_TYPE_WS: "module", CONF_URL: url})
         _LOGGER.debug("Registered the Sing-box Panel Card as a Lovelace resource")
         return True
     except Exception:  # noqa: BLE001 - never break setup over the card
@@ -148,7 +194,8 @@ async def async_unregister_card(hass: HomeAssistant) -> None:
             await resources.async_load()
             resources.loaded = True
         for item in resources.async_items():
-            if item.get(CONF_URL) == CARD_URL_PATH:
+            # Match with and without the cache-busting query string.
+            if str(item.get(CONF_URL, "")).split("?", 1)[0] == CARD_URL_PATH:
                 await resources.async_delete_item(item["id"])
     except Exception:  # noqa: BLE001 - never break unload
         _LOGGER.exception("Could not remove the panel card Lovelace resource")

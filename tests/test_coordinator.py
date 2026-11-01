@@ -307,6 +307,7 @@ async def test_bundled_card_is_served_and_loaded(hass: HomeAssistant) -> None:
         CARD_URL_PATH,
         DATA_CARD_REGISTERED,
         card_path,
+        card_url,
     )
 
     assert card_path().is_file(), "the panel card bundle must ship with the integration"
@@ -327,7 +328,10 @@ async def test_bundled_card_is_served_and_loaded(hass: HomeAssistant) -> None:
     assert hass.data[DATA_CARD_REGISTERED] is True
     # ... and advertised through Lovelace, which is what the apps need.
     urls = [item["url"] for item in hass.data[LOVELACE_DATA].resources.async_items()]
-    assert CARD_URL_PATH in urls
+    assert card_url() in urls
+    # The URL carries a version so an upgraded bundle is not served from the
+    # browser's module cache.
+    assert urls[0].startswith(CARD_URL_PATH + "?v=")
 
 
 async def test_card_falls_back_to_extra_module_without_lovelace(
@@ -342,7 +346,7 @@ async def test_card_falls_back_to_extra_module_without_lovelace(
     from homeassistant.components.lovelace.const import LOVELACE_DATA
     from homeassistant.setup import async_setup_component
 
-    from custom_components.singbox.frontend import CARD_URL_PATH
+    from custom_components.singbox.frontend import card_url
 
     assert await async_setup_component(hass, "lovelace", {})
     await hass.async_block_till_done()
@@ -359,7 +363,7 @@ async def test_card_falls_back_to_extra_module_without_lovelace(
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert CARD_URL_PATH in hass.data[DATA_EXTRA_MODULE_URL].urls
+    assert card_url() in hass.data[DATA_EXTRA_MODULE_URL].urls
 
 
 async def test_card_is_available_when_no_entry_loads(hass: HomeAssistant) -> None:
@@ -373,7 +377,7 @@ async def test_card_is_available_when_no_entry_loads(hass: HomeAssistant) -> Non
     from homeassistant.components.lovelace.const import LOVELACE_DATA
     from homeassistant.setup import async_setup_component
 
-    from custom_components.singbox.frontend import CARD_URL_PATH
+    from custom_components.singbox.frontend import card_url
 
     assert await async_setup_component(hass, "lovelace", {})
     await hass.async_block_till_done()
@@ -390,7 +394,7 @@ async def test_card_is_available_when_no_entry_loads(hass: HomeAssistant) -> Non
     # The entry is not loaded, but the card is still advertised to the UI.
     assert entry.state is ConfigEntryState.SETUP_RETRY
     urls = [item["url"] for item in hass.data[LOVELACE_DATA].resources.async_items()]
-    assert CARD_URL_PATH in urls
+    assert card_url() in urls
 
 
 # -- setup error mapping -----------------------------------------------------
@@ -422,6 +426,38 @@ async def test_setup_maps_errors(
     assert entry.state is expected_state
 
 
+async def test_stale_card_resource_is_migrated(hass: HomeAssistant) -> None:
+    """An unversioned resource from an older release is updated, not duplicated.
+
+    Every release before the versioned URL registered the bare path, and the
+    browser then cached that module forever: an upgraded bundle stayed
+    invisible until the user cleared storage. The stale entry is rewritten in
+    place so exactly one resource loads the card.
+    """
+    from homeassistant.components.lovelace.const import LOVELACE_DATA
+    from homeassistant.setup import async_setup_component
+
+    from custom_components.singbox.frontend import CARD_URL_PATH, card_url
+
+    assert await async_setup_component(hass, "lovelace", {})
+    await hass.async_block_till_done()
+
+    resources = hass.data[LOVELACE_DATA].resources
+    await resources.async_create_item({"res_type": "module", "url": CARD_URL_PATH})
+
+    entry = _entry("card9")
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.singbox.detect_backend",
+        new=AsyncMock(return_value=(FakeGrpcClient(), BACKEND_GRPC)),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    urls = [item["url"] for item in resources.async_items()]
+    assert urls == [card_url()], f"expected exactly the versioned URL, got {urls}"
+
+
 async def test_card_registration_is_idempotent(hass: HomeAssistant) -> None:
     """A reload must not register the static route or the resource twice.
 
@@ -431,7 +467,7 @@ async def test_card_registration_is_idempotent(hass: HomeAssistant) -> None:
     from homeassistant.components.lovelace.const import LOVELACE_DATA
     from homeassistant.setup import async_setup_component
 
-    from custom_components.singbox.frontend import CARD_URL_PATH
+    from custom_components.singbox.frontend import card_url
 
     assert await async_setup_component(hass, "lovelace", {})
     await hass.async_block_till_done()
@@ -445,7 +481,7 @@ async def test_card_registration_is_idempotent(hass: HomeAssistant) -> None:
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         resources = hass.data[LOVELACE_DATA].resources
-        registered = [item for item in resources.async_items() if item["url"] == CARD_URL_PATH]
+        registered = [item for item in resources.async_items() if item["url"] == card_url()]
         assert len(registered) == 1
         assert registered[0]["type"] == "module"
 
@@ -455,4 +491,4 @@ async def test_card_registration_is_idempotent(hass: HomeAssistant) -> None:
         await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.LOADED
-    assert [item for item in resources.async_items() if item["url"] == CARD_URL_PATH] == registered
+    assert [item for item in resources.async_items() if item["url"] == card_url()] == registered
