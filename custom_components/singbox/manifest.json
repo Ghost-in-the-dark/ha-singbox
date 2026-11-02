@@ -1,6 +1,10 @@
 {
   "domain": "singbox",
   "name": "sing-box",
+  "categories": [
+    "computers_network.routers_network",
+    "computers_network.monitoring"
+  ],
   "codeowners": [
     "@Ghost-in-the-dark"
   ],
