@@ -492,3 +492,37 @@ async def test_card_registration_is_idempotent(hass: HomeAssistant) -> None:
 
     assert entry.state is ConfigEntryState.LOADED
     assert [item for item in resources.async_items() if item["url"] == card_url()] == registered
+
+
+# -- blocking I/O ------------------------------------------------------------
+
+
+async def test_card_version_is_read_off_the_event_loop(hass: HomeAssistant) -> None:
+    """The manifest must be read in the executor, never on the loop.
+
+    async_setup runs on the event loop, so a plain Path.read_text() there is a
+    blocking call: Home Assistant logs "Detected blocking call to open ...
+    inside the event loop" and stalls other integrations during setup. The
+    version is resolved through async_add_executor_job and cached per process.
+    """
+    from custom_components.singbox import frontend
+
+    frontend._VERSION_CACHE = None
+    calls: list[str] = []
+    real_executor = hass.async_add_executor_job
+
+    async def spy_executor(func, *args):
+        calls.append(getattr(func, "__name__", repr(func)))
+        return await real_executor(func, *args)
+
+    with patch.object(hass, "async_add_executor_job", side_effect=spy_executor):
+        url = await frontend.async_card_url(hass)
+
+    assert url.startswith(frontend.CARD_URL_PATH + "?v=")
+    assert "_read_card_version" in calls, f"expected an executor job, got {calls}"
+
+    # Cached: a second call does no filesystem work at all.
+    with patch.object(hass, "async_add_executor_job", side_effect=spy_executor) as spy:
+        again = await frontend.async_card_url(hass)
+    assert again == url
+    assert not spy.called

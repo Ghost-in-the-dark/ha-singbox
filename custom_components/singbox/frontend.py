@@ -53,8 +53,15 @@ def card_path() -> Path:
     return Path(__file__).with_name("www") / CARD_FILENAME
 
 
-def _card_version() -> str:
-    """Version string used to bust the frontend module cache."""
+# The manifest is read at most once per process. Home Assistant calls
+# async_setup on the event loop, so every filesystem access here has to run in
+# the executor: a plain read_text() inside the loop is a blocking call (HA
+# reports it as "Detected blocking call to open ... inside the event loop").
+_VERSION_CACHE: str | None = None
+
+
+def _read_card_version() -> str:
+    """Read the manifest version (blocking — executor only)."""
     try:
         # The manifest version is what users see in HACS and in releases, and
         # the bundle changes together with it — the right cache key.
@@ -62,6 +69,18 @@ def _card_version() -> str:
         return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
     except Exception:  # noqa: BLE001 - cache busting must never break setup
         return ""
+
+
+def _versioned_url(version: str) -> str:
+    return f"{CARD_URL_PATH}?v={version}" if version else CARD_URL_PATH
+
+
+async def async_card_url(hass: HomeAssistant) -> str:
+    """Resource URL, resolved off the event loop and cached per process."""
+    global _VERSION_CACHE
+    if _VERSION_CACHE is None:
+        _VERSION_CACHE = await hass.async_add_executor_job(_read_card_version)
+    return _versioned_url(_VERSION_CACHE)
 
 
 def card_url() -> str:
@@ -72,15 +91,20 @@ def card_url() -> str:
     cleared storage by hand (the card even kept reporting the old version in
     its footer). A query string changes the URL per release, so the frontend
     fetches the new bundle and the old entry is replaced in place.
+
+    Synchronous entry point, meant for tests and other non-loop callers; code
+    running on the event loop must use async_card_url() instead.
     """
-    version = _card_version()
-    return f"{CARD_URL_PATH}?v={version}" if version else CARD_URL_PATH
+    global _VERSION_CACHE
+    if _VERSION_CACHE is None:
+        _VERSION_CACHE = _read_card_version()
+    return _versioned_url(_VERSION_CACHE)
 
 
 async def async_register_card(hass: HomeAssistant) -> None:
     """Expose the bundled card and make every dashboard load it."""
     path = card_path()
-    if not path.is_file():
+    if not await hass.async_add_executor_job(path.is_file):
         _LOGGER.warning("Bundled panel card not found at %s", path)
         return
 
@@ -113,7 +137,7 @@ async def async_register_card(hass: HomeAssistant) -> None:
     # fall back to the extra frontend module. It is unreliable on the legacy
     # build, but it is better than not loading the card at all.
     try:
-        add_extra_js_url(hass, card_url())
+        add_extra_js_url(hass, await async_card_url(hass))
     except Exception:  # noqa: BLE001 - never break setup over the card
         _LOGGER.exception("Could not load the bundled panel card")
 
@@ -139,7 +163,7 @@ async def _async_register_lovelace_resource(hass: HomeAssistant) -> bool:
     if resources is None or not hasattr(resources, "async_create_item"):
         return False
 
-    url = card_url()
+    url = await async_card_url(hass)
     try:
         if not getattr(resources, "loaded", False):
             await resources.async_load()
