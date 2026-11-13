@@ -20,6 +20,40 @@ Verified against sing-box 1.14.0 (clash_api):
 * ``DELETE /connections/`` (all) and ``DELETE /connections/{id}``
 * Auth: ``Authorization: Bearer <secret>`` -> 401 without it
 
+Compatibility with the "premium" / PDK builds
+==============================================
+
+Sing-box ships in several flavours: the upstream release, and builds that
+report ``premium: true`` / ``meta: true`` from ``/version`` (the PDK fork,
+"sing-box 1.14.4-pdk-...", and the mihomo-flavoured distributions). They
+expose the same clash controller, with a few extra or missing pieces.
+Measured against upstream 1.14.4 and sing-box 1.14.4-pdk:
+
+============================  ==========  ============
+endpoint                      upstream    premium
+============================  ==========  ============
+``GET /version``              yes         yes (+meta)
+``GET /configs``, ``/proxies`` yes        yes
+``GET /group``                yes         yes
+``GET /group/{tag}/delay``    yes         yes
+``GET /rules``                null list   real rules
+``GET /providers/proxies``    stub {}     stub {}
+``GET /dns/query``            yes         yes
+``POST /cache/fakeip/flush``  yes         yes
+``POST /upgrade/ui``          404         200
+============================  ==========  ============
+
+So the premium additions are *optional extras*, never requirements: every
+call this module makes has to keep working when the extra endpoint answers
+404 or an empty payload, and the client must never treat "this build does
+not have feature X" as a fatal error. That is what the capability flags on
+:class:`ClashClient` are for.
+
+A second, more subtle difference: a proxy *tag* is arbitrary user text
+("My servers: EU2", "ru: Game_ru", emoji, spaces). Embedded slashes would
+break the path, so tags are percent-encoded with ``quote(safe="")``.
+Upstream and premium both accept that form.
+
 Only aiohttp is used, which ships with Home Assistant.
 """
 
@@ -30,8 +64,10 @@ import inspect
 import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -63,6 +99,21 @@ POLL_INTERVAL_SECONDS = 5
 # groups answer HTTP 400 "Must be a Selector". Creating select entities for
 # them made every switch from Home Assistant / the panel card fail.
 _SELECTABLE_GROUP_TYPES = frozenset({"Selector"})
+
+# Group types the clash API can batch-test with GET /group/{tag}/delay.
+# Upstream answers 404 for a leaf outbound and for GLOBAL, and the premium
+# builds answer 404 for anything that is not a group, so the caller falls back
+# to the per-proxy endpoint for those. Reject groups cannot be tested at all.
+_GROUP_DELAY_TYPES = frozenset({"Selector", "URLTest", "Fallback", "LoadBalance"})
+
+# Outbounds that can never answer a url-test. GLOBAL is the synthetic clash-API
+# group (it is a Fallback over *all* outbounds, has no backing sing-box outbound
+# and answers 404), and Reject/Block fail every test by construction: probing
+# them is what used to raise "An error occurred in the delay test" (HTTP 503)
+# for the "block" outbound and paint a red "action failed" banner in the UI.
+_UNTESTABLE_TYPES = frozenset({"Reject", "RejectDrop", "Block", "Pass", "Dns"})
+_UNTESTABLE_TAGS = frozenset({"GLOBAL", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"})
+_UNTESTABLE_TAGS_UPPER = frozenset(tag.upper() for tag in _UNTESTABLE_TAGS)
 
 
 # Guards the "now" walk in _last_url_test_delay. A selector may point at a
@@ -102,12 +153,84 @@ def _last_url_test_delay(info: dict, all_proxies: dict) -> tuple[int, int]:
     return 0, 0
 
 
+@dataclass
+class PingResult:
+    """Outcome of one url-test, in the shape the card and the sensors need.
+
+    ``delay`` is 0 when the test failed or has not run; ``failed`` says which
+    of the two it was. Keeping them apart matters: a failed test is a real
+    answer ("this outbound cannot reach the URL") and is drawn in red, while
+    "no data yet" is drawn as a neutral dash.
+
+    ``test_time`` is epoch milliseconds, matching the gRPC backend's
+    ``url_test_time`` so both backends feed the same sensor attribute.
+    """
+
+    tag: str
+    delay: int = 0
+    failed: bool = False
+    test_time: int = 0
+
+
+def is_testable_proxy(tag: str, info: dict | None) -> bool:
+    """True when a url-test of this outbound can succeed at all.
+
+    Two kinds of outbound can never answer: the synthetic ``GLOBAL`` group
+    (no backing sing-box outbound, always 404) and the reject/block outbounds
+    (they fail by construction, HTTP 503). Testing them produced an error
+    banner for every batch ping, so they are filtered out before the call.
+    """
+    if tag.upper() in _UNTESTABLE_TAGS_UPPER:
+        return False
+    if isinstance(info, dict) and str(info.get("type", "")) in _UNTESTABLE_TYPES:
+        return False
+    return True
+
+
+def parse_group_delay(payload: object) -> dict[str, int]:
+    """Unpack a ``GET /group/{tag}/delay`` reply into {member tag: ms}.
+
+    Upstream and premium both answer with a flat object keyed by the group's
+    members, e.g. ``{"eu: EU2": 152, "eu: EU-openwrt": 130}``.
+    Entries whose delay is not a usable number are dropped instead of being
+    reported as 0, because 0 means "failed" everywhere else.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, int] = {}
+    for tag, delay in payload.items():
+        if not isinstance(tag, str):
+            continue
+        if isinstance(delay, bool) or not isinstance(delay, int):
+            continue
+        result[tag] = delay if delay > 0 else 0
+    return result
+
+
+def _best_delay(delays) -> int:
+    """Smallest usable (positive) delay of a group's members, 0 if none.
+
+    sing-box reports a failed member as 0 in a group delay reply, so the zeros
+    say "this node failed", not "this node is instant". The smallest positive
+    value is the delay the group would actually route to, i.e. what the
+    group's ping means to a user. min() over the positives is deliberate:
+    max() reported the slowest node instead (a 176 ms group showed as 820 ms).
+    """
+    positive = [delay for delay in delays if isinstance(delay, int) and delay > 0]
+    return min(positive) if positive else 0
+
+
 def _endpoint(addr: object, port: object) -> str:
     """Render a clash metadata address/port pair as "ip:port"."""
     host = addr if isinstance(addr, str) else ""
     if port is None or port == "":
         return host
     return f"{host}:{port}"
+
+
+def _now_ms() -> int:
+    """Current wall-clock time in epoch milliseconds."""
+    return int(datetime.now().timestamp() * 1000)
 
 
 def _parse_epoch_ms(value: object) -> int:
@@ -234,6 +357,18 @@ class ClashClient:
         self._session = session
         self._own_session = session is None
         self._ws: list[aiohttp.ClientWebSocketResponse] = []
+        # Feature flags, filled by detect_capabilities(). They default to the
+        # conservative upstream answer (no premium extras) so a client that
+        # never ran detection behaves like sing-box <= 1.14.0: everything
+        # optional is skipped instead of being requested and failing.
+        self.premium = False
+        self.meta = False
+        self.group_delay_available = False
+        self.rules_available = False
+        # Last url-test outcome per outbound tag. Populated by url_test() and
+        # url_test_many(); the sensors and the websocket status command read
+        # it so a failed test is distinguishable from "never tested".
+        self.last_pings: dict[str, PingResult] = {}
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
@@ -299,6 +434,21 @@ class ClashClient:
     # -- static info ---------------------------------------------------------
 
     async def get_version(self) -> str:
+        version, premium, meta = await self.get_version_info()
+        self.premium = premium
+        self.meta = meta
+        return version
+
+    async def get_version_info(self) -> tuple[str, bool, bool]:
+        """Return (version, premium, meta) and remember the build flavour.
+
+        ``premium``/``meta`` are what sing-box and its forks use to advertise
+        the extra clash-API surface. Upstream builds answer
+        ``{"meta": true, "premium": true}`` as well since 1.11 (the fields
+        describe the *API* compatibility level, not a paid tier), so they are
+        informational: the real capability probe is
+        :meth:`detect_capabilities`.
+        """
         data = await self._json("GET", "/version")
         if not isinstance(data, dict):
             raise ClashApiError(200, f"unexpected /version response: {type(data).__name__}")
@@ -306,7 +456,41 @@ class ClashClient:
         # "sing-box 1.14.0" -> "1.14.0" to match the gRPC GetVersion response.
         if version.startswith("sing-box "):
             version = version.removeprefix("sing-box ")
-        return version
+        premium = bool(data.get("premium"))
+        meta = bool(data.get("meta"))
+        self.premium = premium
+        self.meta = meta
+        return version, premium, meta
+
+    async def detect_capabilities(self) -> None:
+        """Probe the optional clash-API endpoints once, after connecting.
+
+        Every extra here is additive: a build that answers 404 or an empty
+        payload simply loses the feature and keeps working. Detection runs
+        once per client because the answer cannot change without a restart of
+        sing-box (and a restart is exactly when the client is rebuilt).
+        """
+        try:
+            data = await self._json("GET", "/group")
+        except (ClashApiError, TimeoutError, ConnectionError, OSError):
+            data = None
+        groups = data.get("proxies") if isinstance(data, dict) else None
+        self.group_delay_available = bool(groups)
+
+        try:
+            rules = await self._json("GET", "/rules")
+        except (ClashApiError, TimeoutError, ConnectionError, OSError):
+            rules = None
+        # Upstream answers {"rules": null} until the router exposes them;
+        # the premium builds answer the real list.
+        rule_list = rules.get("rules") if isinstance(rules, dict) else None
+        self.rules_available = isinstance(rule_list, list) and bool(rule_list)
+        _LOGGER.debug(
+            "clash API capabilities: group_delay=%s rules=%s premium=%s",
+            self.group_delay_available,
+            self.rules_available,
+            self.premium,
+        )
 
     async def get_configs(self) -> tuple[list[str], str]:
         """Return (mode_list, current_mode)."""
@@ -349,12 +533,23 @@ class ClashClient:
             if name == "GLOBAL":
                 continue
             delay, delay_time = _last_url_test_delay(info, raw)
+            # A failure the bridge reported itself wins over a stale history
+            # entry: sing-box only appends to history on success, so an
+            # outbound that worked an hour ago and fails now would otherwise
+            # keep showing the old green delay forever.
+            ping = self.last_pings.get(name)
+            failed = bool(ping and ping.failed)
+            if ping is not None and ping.delay > 0 and not ping.failed:
+                delay, delay_time = ping.delay, ping.test_time
+            elif failed:
+                delay, delay_time = 0, ping.test_time if ping is not None else 0
             proxies.append(
                 SingBoxGroupItem(
                     tag=name,
                     type=info.get("type", ""),
                     url_test_time=delay_time,
                     url_test_delay=delay,
+                    url_test_failed=failed,
                 )
             )
             group_type = info.get("type", "")
@@ -400,31 +595,262 @@ class ClashClient:
     # -- control -------------------------------------------------------------
 
     async def select_outbound(self, group_tag: str, outbound_tag: str) -> None:
-        await self._json("PUT", f"/proxies/{group_tag}/", json_body={"name": outbound_tag})
+        """Select an outbound inside a selector group.
+
+        The tag is percent-encoded: a real subscription uses tags like
+        "eu: EU2", "ru: 🇫🇮 Финляндия · XHTTP" or anything with a slash, and
+        an unencoded tag either 404s (the path no longer matches) or, when it
+        contains a "/", is routed to a completely different endpoint. Both
+        the upstream and the premium builds accept the encoded form.
+        """
+        path = f"/proxies/{quote(group_tag, safe='')}/"
+        await self._json("PUT", path, json_body={"name": outbound_tag})
 
     async def set_clash_mode(self, mode: str) -> None:
         await self._json("PUT", "/configs", json_body={"mode": mode})
 
-    async def url_test(self, outbound_tag: str, url: str | None = None) -> None:
-        data = await self._json(
-            "GET",
-            f"/proxies/{outbound_tag}/delay",
-            params={
-                "url": url or DEFAULT_URL_TEST_URL,
-                "timeout": str(_URL_TEST_TIMEOUT_MS),
-            },
-        )
-        # sing-box answers 200 with {"delay": 0} when the test fails, which the
-        # service used to swallow as a success.
-        if isinstance(data, dict) and isinstance(data.get("delay"), int):
-            if data["delay"] <= 0:
-                raise ClashApiError(200, f"url test for {outbound_tag} failed")
+    async def url_test(self, outbound_tag: str, url: str | None = None) -> PingResult:
+        """Run one url-test and return its outcome instead of raising.
+
+        Every failure mode of a real installation used to surface as an
+        exception, and Home Assistant turned that into the full-screen red
+        "Failed to perform the action singbox/url_test" banner:
+
+        * ``503 An error occurred in the delay test`` - the outbound is a
+          reject/block outbound (it cannot connect by definition);
+        * ``404 Resource not found`` - the outbound is the synthetic
+          ``GLOBAL`` group, or a tag that disappeared between two polls;
+        * ``200 {"delay": 0}`` - the test ran and failed.
+
+        A failed url-test is *data*, not an integration error: the card wants
+        to paint that node red, not make the whole dashboard apologise. So
+        the result is recorded on the client, kept in ``last_pings`` for the
+        sensors/websocket, and returned. Only transport-level problems
+        (unreachable server, wrong secret) still raise, because those are
+        real failures of the integration itself.
+        """
+        result = await self._delay_for(outbound_tag, url)
+        self.last_pings[outbound_tag] = result
+        return result
+
+    async def _delay_for(self, outbound_tag: str, url: str | None) -> PingResult:
+        """Query ``/proxies/{tag}/delay`` and normalise every answer.
+
+        Auth errors and connection errors propagate: they are not about this
+        particular outbound. Everything else becomes a PingResult.
+        """
+        params = {
+            "url": url or DEFAULT_URL_TEST_URL,
+            "timeout": str(_URL_TEST_TIMEOUT_MS),
+        }
+        try:
+            data = await self._json(
+                "GET", f"/proxies/{quote(outbound_tag, safe='')}/delay", params=params
+            )
+        except ClashApiError as err:
+            if is_auth_error(err):
+                raise
+            _LOGGER.debug("url test for %s failed: %s", outbound_tag, err)
+            return PingResult(tag=outbound_tag, failed=True)
+        if not isinstance(data, dict):
+            return PingResult(tag=outbound_tag, failed=True)
+        delay = data.get("delay")
+        # A group answers with {member: ms} instead of {"delay": ms}. The
+        # current outbound of the group is the one the user sees in the
+        # header, so its delay is the group's delay.
+        if not isinstance(delay, int) or isinstance(delay, bool):
+            members = parse_group_delay(data)
+            if not members:
+                return PingResult(tag=outbound_tag, failed=True)
+            # Failed members are reported as 0 by the server, so only the
+            # positive delays are real measurements. The best of them is what
+            # a url-test/fallback group would route to, which is what the
+            # group's ping means. Taking max() here reported the *worst* node
+            # of the group (a 176 ms member showed as "820 ms" in the card).
+            best = _best_delay(members.values())
+            if best <= 0:
+                return PingResult(tag=outbound_tag, failed=True)
+            return PingResult(tag=outbound_tag, delay=best, test_time=_now_ms())
+        if delay <= 0:
+            return PingResult(tag=outbound_tag, failed=True)
+        return PingResult(tag=outbound_tag, delay=delay, test_time=_now_ms())
+
+    async def url_test_many(self, tags: list[str], url: str | None = None) -> dict[str, PingResult]:
+        """Test several outbounds, using the group batch endpoint when it exists.
+
+        ``GET /group/{tag}/delay`` returns the delay of every member of a group
+        in one round trip, which is exactly what the card's "test this group"
+        button needs (testing the group tag itself only refreshes the currently
+        selected member). It exists in upstream 1.14.4 and in the premium
+        builds, but answers 404 for leaf outbounds, for ``GLOBAL`` and for the
+        reject outbounds, so anything it cannot answer is retried per proxy.
+        """
+        results: dict[str, PingResult] = {}
+        remaining: list[str] = []
+        for tag in tags:
+            if is_testable_proxy(tag, None):
+                remaining.append(tag)
+        if self.group_delay_available and remaining:
+            for tag in list(remaining):
+                members = await self._group_delay(tag, url)
+                if not members:
+                    continue
+                remaining.remove(tag)
+                results[tag] = PingResult(
+                    tag=tag, delay=_best_delay(members.values()), test_time=_now_ms()
+                )
+                for member, delay in members.items():
+                    if member == tag:
+                        continue
+                    results.setdefault(
+                        member,
+                        PingResult(
+                            tag=member,
+                            delay=delay,
+                            failed=delay <= 0,
+                            test_time=_now_ms(),
+                        ),
+                    )
+        # Per-proxy pass for whatever the batch endpoint did not cover.
+        for tag in remaining:
+            results[tag] = await self._delay_for(tag, url)
+        for tag, ping in results.items():
+            self.last_pings[tag] = ping
+        return results
+
+    async def _group_delay(self, group_tag: str, url: str | None = None) -> dict[str, int]:
+        """Batch-test a group; empty dict when this build cannot do it.
+
+        The URL defaults for the same reason as on the per-proxy path: this
+        is the only entry point the card and the service use to refresh a
+        whole group, and requiring the caller to pass a URL that almost always
+        is DEFAULT_URL_TEST_URL was a needless foot-gun (calling it without
+        one raised TypeError, which is not an API answer at all).
+        """
+        try:
+            data = await self._json(
+                "GET",
+                f"/group/{quote(group_tag, safe='')}/delay",
+                params={"url": url or DEFAULT_URL_TEST_URL, "timeout": str(_URL_TEST_TIMEOUT_MS)},
+            )
+        except ClashApiError as err:
+            if is_auth_error(err):
+                raise
+            return {}
+        return parse_group_delay(data)
+
+    # -- optional / premium endpoints ---------------------------------------
+
+    async def reload_config(self, force: bool = True) -> None:
+        """Ask the server to re-apply its configuration.
+
+        The route is PUT /configs: the clash-API router mounts exactly GET,
+        PUT and PATCH on /configs (experimental/clashapi/configs.go), so POST
+        is answered with 405 by *every* build - upstream and premium alike.
+        The previous version posted there and therefore reported "not
+        supported" on a server that does implement the route.
+
+        What the route does depends on the build. In upstream sing-box
+        updateConfigs is a deliberate no-op that answers 204
+        (render.NoContent, no body read, no reload), and both 1.14.4 and
+        1.14.4-pdk behave exactly like that: the request succeeds, yet an
+        outbound added to the config file does not appear afterwards. So this
+        method reports *acceptance*, which is all the API can promise, and
+        keeps the SingBoxNotSupported mapping for builds that reject the route
+        outright.
+        """
+        try:
+            await self._json(
+                "PUT", "/configs", params={"force": "true"} if force else None, json_body={}
+            )
+        except ClashApiError as err:
+            if is_auth_error(err):
+                raise
+            raise SingBoxNotSupported(
+                f"this sing-box build does not accept a config reload ({err})"
+            ) from err
+
+    async def flush_fakeip_cache(self) -> None:
+        """Drop the fake-IP cache (POST /cache/fakeip/flush, 204)."""
+        await self._post_optional("/cache/fakeip/flush", "flushing the fake-IP cache")
+
+    async def flush_dns_cache(self) -> None:
+        """Drop the DNS cache (POST /cache/dns/flush)."""
+        await self._post_optional("/cache/dns/flush", "flushing the DNS cache")
+
+    async def _post_optional(self, path: str, action: str) -> None:
+        try:
+            await self._json("POST", path)
+        except ClashApiError as err:
+            # A rejected secret is not "this build lacks the feature": reporting
+            # it as SingBoxNotSupported turned a reauth-worthy 401 into a
+            # harmless capability message, so the entry never re-authenticated.
+            if is_auth_error(err):
+                raise
+            raise SingBoxNotSupported(
+                f"{action} is not supported by this sing-box build ({err})"
+            ) from err
+
+    async def get_rules(self) -> list[dict[str, str]]:
+        """Return the route rules; empty on builds that do not expose them.
+
+        Upstream 1.14.4 answers ``{"rules": null}`` and premium builds answer
+        the real list, so the empty case is normal and must not be an error.
+        """
+        try:
+            data = await self._json("GET", "/rules")
+        except ClashApiError as err:
+            # 404 on a build without the endpoint is normal ("no rules to
+            # show"), but 401/403 means the entry lost access: swallowing that
+            # hid an expired secret from the reauth flow.
+            if is_auth_error(err):
+                raise
+            return []
+        raw = data.get("rules") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return []
+        rules: list[dict[str, str]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            rules.append(
+                {
+                    "type": str(entry.get("type", "")),
+                    "payload": str(entry.get("payload", "")),
+                    "proxy": str(entry.get("proxy", "")),
+                }
+            )
+        return rules
+
+    async def dns_query(self, name: str, record_type: str = "A") -> dict[str, Any]:
+        """Resolve a name through sing-box's own DNS (premium endpoint).
+
+        A 400 (the server rejected the record type) propagates unchanged: it is
+        the caller's mistake, not a missing feature. Only a missing route turns
+        into SingBoxNotSupported.
+        """
+        try:
+            data = await self._json(
+                "GET", "/dns/query", params={"name": name, "type": record_type.upper()}
+            )
+        except ClashApiError as err:
+            if is_auth_error(err) or err.status == 400:
+                raise
+            raise SingBoxNotSupported(
+                f"DNS queries are not supported by this sing-box build ({err})"
+            ) from err
+        return data if isinstance(data, dict) else {}
 
     async def set_group_expand(self, group_tag: str, is_expand: bool) -> None:
         raise SingBoxNotSupported("expanding a group is not supported by the clash API backend")
 
     async def close_connection(self, connection_id: str) -> None:
-        await self._json("DELETE", f"/connections/{connection_id}")
+        """Close one connection by id.
+
+        Encoded for the same reason as the proxy tags: the id is opaque server
+        text, and a "/" in it would silently address a different endpoint.
+        """
+        await self._json("DELETE", f"/connections/{quote(connection_id, safe='')}")
 
     async def close_all_connections(self) -> None:
         await self._json("DELETE", "/connections/")

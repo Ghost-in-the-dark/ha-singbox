@@ -38,11 +38,23 @@ url_test:
         text:
     outbound_tag:
       name: Outbound tag
-      description: Tag of the outbound group to test.
-      required: true
+      description: >-
+        Tag of a single outbound or group to test. Either this or
+        outbound_tags is required.
+      required: false
       example: auto
       selector:
         text:
+    outbound_tags:
+      name: Outbound tags
+      description: >-
+        Test several outbounds or groups in one call. On the clash API backend
+        a group is tested through the batch endpoint, so every member is
+        refreshed in a single round trip instead of one request per node.
+      required: false
+      example: '["auto", "proxy"]'
+      selector:
+        object:
     url:
       name: Test URL
       description: >-
@@ -118,5 +130,114 @@ set_clash_mode:
       name: Mode
       description: Clash mode to activate (e.g. rule, global, direct).
       required: true
+      selector:
+        text:
+
+reload_config:
+  name: Reload config
+  description: >-
+    Ask sing-box to re-apply its configuration (PUT /configs). Upstream
+    sing-box answers 204 but does not re-read the config file: verified on
+    1.14.4 and 1.14.4-pdk, an outbound added to the config file does not
+    appear after the call. The service is kept for forks and builds that do
+    implement the reload. Needs the clash API backend; on the gRPC backend it
+    reports that the action is not supported.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      example: 01JEXAMPLE
+      selector:
+        text:
+    force:
+      name: Force
+      description: >-
+        Request a reload even when the server thinks nothing changed. Sent as
+        the force query parameter; builds that ignore it still answer 204.
+      required: false
+      example: true
+      selector:
+        boolean:
+
+flush_fakeip_cache:
+  name: Flush fake-IP cache
+  description: >-
+    Drop the fake-IP cache of sing-box (POST /cache/fakeip/flush). Needs the
+    clash API backend and a build that exposes the endpoint; on the gRPC
+    backend it reports that the action is not supported. A server without a
+    fake-IP inbound still answers 204.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      example: 01JEXAMPLE
+      selector:
+        text:
+
+flush_dns_cache:
+  name: Flush DNS cache
+  description: >-
+    Drop the DNS cache of sing-box (POST /cache/dns/flush). Needs the clash
+    API backend and a build that exposes the endpoint; on the gRPC backend it
+    reports that the action is not supported. A server without a cache file
+    still answers 204.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      example: 01JEXAMPLE
+      selector:
+        text:
+
+refresh_rules:
+  name: Refresh rules
+  description: >-
+    Re-read the route rules through the sing-box API (GET /rules) and store
+    them in the coordinator snapshot, where diagnostics shows them. Upstream
+    sing-box answers with an empty list because it does not publish rules over
+    the API; builds such as 1.14.4-pdk return the real rules, and an empty
+    answer is not an error. Needs the clash API backend; on the gRPC backend it
+    reports that the action is not supported.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      example: 01JEXAMPLE
+      selector:
+        text:
+
+dns_query:
+  name: DNS query
+  description: >-
+    Resolve a name with the DNS resolver of sing-box itself (GET /dns/query)
+    and return the answer to the caller through a response variable, so it can
+    be used from Developer Tools and from automations. The server picks the DNS
+    server and the outbound by its own route rules, so the answer can differ
+    from a query sent from the host. Needs the clash API backend; on the gRPC
+    backend it reports that the action is not supported.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID, required only when multiple sing-box instances are configured.
+      required: false
+      example: 01JEXAMPLE
+      selector:
+        text:
+    name:
+      name: Name
+      description: Domain name to resolve.
+      required: true
+      example: example.com
+      selector:
+        text:
+    type:
+      name: Record type
+      description: DNS record type to query (A, AAAA, CNAME, MX, TXT, ...). Defaults to A.
+      required: false
+      example: A
       selector:
         text:

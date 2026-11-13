@@ -11,7 +11,7 @@ import {
     sortConnections,
 } from "./singbox-panel-connections.js";
 
-const CARD_VERSION = "0.1.17";
+const CARD_VERSION = "0.1.18";
 
 // unique_id formats used by the ha-singbox integration:
 //   select: "{entry_id}_group_{group_tag}"
@@ -28,6 +28,22 @@ const SYNTHETIC_GLOBAL = "GLOBAL";
 const PENDING_SELECT_TTL_MS = 10000;
 
 const DEFAULT_TITLE = "Sing-box";
+
+// The card reads most values from entities, but the last url-test result is
+// also available over websocket (the singbox/status command). It is the only
+// source when history recording is off and the integration creates no ping
+// sensors at all, so every ping chip must work from it too.
+const STATUS_COMMAND = "singbox/status";
+
+// Marker returned by _ping() for a failed url-test. The integration keeps the
+// ping sensor's state "unknown" in that case and flags the failure in the
+// last_test_failed attribute, so a failure needs its own value — distinct from
+// null ("never tested") and from a numeric delay.
+const PING_FAILED = Object.freeze({ failed: true });
+
+function isPingFailed(value) {
+    return Boolean(value && typeof value === "object" && value.failed === true);
+}
 
 // Traffic chart: how many samples the ring buffer holds and how far back the
 // window spans. One sample per hass push (the integration pushes about once a
@@ -87,6 +103,24 @@ class SingBoxPanelCard extends LitElement {
         this._connPollTimer = null;
         this._connFetchInFlight = false;
         this._chartTimer = null;
+        // Live url-test results from the singbox/status WS command:
+        // proxy tag -> { delay, failed, test_time }. The only ping source on
+        // an install without ping sensors (history recording switched off),
+        // and the freshest one everywhere else.
+        this._livePings = new Map();
+        // Standalone outbounds the status command contributed (no ping sensor
+        // backs them). Remembered so a later poll can drop the ones sing-box
+        // stopped reporting instead of leaving stale rows behind.
+        this._autoStandalone = new Set();
+        // The command does not exist in older integrations; that is expected
+        // and must not spam the console — remember the verdict.
+        this._statusSupported = true;
+        this._statusFetchInFlight = false;
+        this._statusTimer = null;
+        // The status timer must also stop when the card is detached while a
+        // request is in flight, otherwise the callback would reschedule it and
+        // the card would poll forever outside the DOM.
+        this._detached = false;
     }
 
     static getStubConfig() {
@@ -205,11 +239,13 @@ class SingBoxPanelCard extends LitElement {
 
     connectedCallback() {
         super.connectedCallback();
+        this._detached = false;
         if (this._discovered) this._startConnectionPolling();
     }
 
     disconnectedCallback() {
         super.disconnectedCallback();
+        this._detached = true;
         this._stopConnectionPolling();
     }
 
@@ -294,6 +330,10 @@ class SingBoxPanelCard extends LitElement {
             // by the config entry, so the card works even when the registry
             // does not link them to an entry.
             this._model = this._buildModel(entries);
+            // The rebuilt model knows only the registry: whatever the status
+            // command added earlier is gone and will be re-added on its next
+            // poll (or stays gone when the outbound really disappeared).
+            this._autoStandalone = new Set();
             if (this._model.groups.length === 0) {
                 const allSelects = registry.filter(
                     (e) => this._domain(e) === "select"
@@ -568,16 +608,45 @@ class SingBoxPanelCard extends LitElement {
         return `${scaled.toLocaleString(undefined, { maximumFractionDigits: digits })} ${units[idx]}`;
     }
 
+    // Live url-test result of one outbound, as a number of milliseconds, the
+    // PING_FAILED marker, or null when it was never measured. Three sources,
+    // in order of authority:
+    //   1. the ping sensor entity — unless it is unknown/unavailable, which is
+    //      exactly what a failed test looks like (last_test_failed: true);
+    //   2. the singbox/status websocket data — the only source on an install
+    //      where the integration creates no ping sensors (history off);
+    //   3. the marker left by the sensor for a failed test.
     _ping(option) {
         const state = this._entity(option.pingEntity);
-        if (!state || state.state === "unavailable" || state.state === "unknown") {
-            return null;
+        const reported = state && state.state;
+        const measured =
+            reported !== undefined &&
+            reported !== null &&
+            reported !== "unavailable" &&
+            reported !== "unknown";
+        if (measured) {
+            const ms = Number(reported);
+            if (Number.isFinite(ms)) return ms;
         }
-        const ms = Number(state.state);
-        return Number.isFinite(ms) ? ms : null;
+        const live = option.tag ? this._livePings.get(option.tag) : null;
+        if (live) {
+            if (live.failed) return PING_FAILED;
+            if (Number.isFinite(live.delay) && live.delay > 0) return live.delay;
+        }
+        if (
+            state &&
+            state.attributes &&
+            state.attributes.last_test_failed === true
+        ) {
+            return PING_FAILED;
+        }
+        return null;
     }
 
+    // The chip is always rendered (a failed or never-tested outbound is
+    // information, not absence), so a null ping is the grey "—" of .none.
     _pingClass(ms) {
+        if (isPingFailed(ms)) return "fail";
         if (ms === null) return "none";
         if (ms <= 100) return "good";
         if (ms <= 300) return "warn";
@@ -585,7 +654,187 @@ class SingBoxPanelCard extends LitElement {
     }
 
     _pingText(ms) {
+        if (isPingFailed(ms)) return "✕";
         return ms === null ? "—" : `${ms} ms`;
+    }
+
+    _pingTitle(ms, tag) {
+        if (isPingFailed(ms)) return this._t("pingFailed", { tag });
+        if (ms === null) return this._t("pingNone", { tag });
+        return `${ms} ms`;
+    }
+
+    // -- live url-test results (websocket) -----------------------------------
+
+    // The last url-test results are also published by the singbox/status
+    // command. Polling it keeps the ping chips alive on installs without ping
+    // sensors; on installs with sensors it is merely fresher than the push.
+    async _fetchLivePings() {
+        if (!this._hass || !this._statusSupported || this._statusFetchInFlight) {
+            return;
+        }
+        this._statusFetchInFlight = true;
+        try {
+            // Same shape as singbox/connections: entry_id is a hint, and the
+            // registry can name an entry that is no longer loaded, so retry
+            // entry-less once before giving up.
+            const message = { type: STATUS_COMMAND };
+            const entryId = this._entryId();
+            if (entryId) message.entry_id = entryId;
+            let res;
+            try {
+                res = await this._hass.callWS(message);
+            } catch (err) {
+                if (!entryId || this._isUnknownStatusCommand(err)) throw err;
+                res = await this._hass.callWS({ type: STATUS_COMMAND });
+            }
+            this._applyStatus(res);
+        } catch (err) {
+            // An integration without the command simply has no live pings:
+            // remember it, log once, and let the sensors do the work.
+            if (this._isUnknownStatusCommand(err)) {
+                this._statusSupported = false;
+                console.warn(
+                    "singbox-panel: singbox/status is unavailable (older integration) — ping chips fall back to sensors"
+                );
+            }
+            // Any other failure is transient (reload in progress, entry not
+            // loaded yet); keep polling, the next tick retries.
+        } finally {
+            this._statusFetchInFlight = false;
+        }
+    }
+
+    _isUnknownStatusCommand(err) {
+        const msg = String(err && err.message ? err.message : err);
+        // "unknown command" is what Home Assistant answers for a command the
+        // integration never registered; the other two are the "not found"
+        // error an entry-scoped command returns for a vanished entry.
+        return /unknown command|not_found|not found/i.test(msg);
+    }
+
+    _applyStatus(res) {
+        const proxies = Array.isArray(res && res.proxies) ? res.proxies : [];
+        const next = new Map();
+        for (const proxy of proxies) {
+            if (!proxy || !proxy.tag) continue;
+            const delay = Number(proxy.delay);
+            next.set(proxy.tag, {
+                // sing-box reports 0 for a never-tested outbound.
+                delay: Number.isFinite(delay) && delay > 0 ? delay : null,
+                failed: proxy.failed === true,
+                test_time: Number(proxy.test_time) || 0,
+            });
+        }
+        const changed = this._livePingsChanged(next);
+        this._livePings = next;
+        // Only a real change repaints: like the connections poll, the ping
+        // refresh must not force a paint on every tick of the throttle.
+        const modelChanged = this._augmentStandalone(res);
+        if (changed || modelChanged) this._scheduleRender();
+    }
+
+    // Standalone outbounds (VPN interfaces, direct links, ...) are normally
+    // discovered through their ping sensors alone. With history recording off
+    // there are no such sensors, so the whole "Outbound" block would disappear
+    // even though the status command knows every proxy. Add the ones that are
+    // not part of a group; group members and group tags themselves are left
+    // to the select entities, which exist regardless of the history setting.
+    _augmentStandalone(res) {
+        const model = this._model;
+        if (!model) return false;
+        const proxies = Array.isArray(res && res.proxies) ? res.proxies : [];
+        if (proxies.length === 0) return false;
+        const groups = Array.isArray(res && res.groups) ? res.groups : [];
+        const groupTags = new Set(
+            groups.map((g) => g && g.tag).filter(Boolean)
+        );
+        for (const group of model.groups) groupTags.add(group.tag);
+        const inGroups = new Set();
+        for (const group of model.groups) {
+            for (const option of group.options) inGroups.add(option.tag);
+        }
+        // The command also lists each group's members; use them so an outbound
+        // is never shown twice when the select entity's options are stale.
+        for (const group of groups) {
+            const items = Array.isArray(group && group.items) ? group.items : [];
+            for (const item of items) {
+                if (typeof item === "string") inGroups.add(item);
+                else if (item && item.tag) inGroups.add(item.tag);
+            }
+        }
+        const excluded = new Set(this._config.exclude_outbounds || []);
+        const live = new Set(
+            proxies.map((p) => p && p.tag).filter(Boolean)
+        );
+        // Keep the sensor-backed rows plus the ones still reported by the
+        // command; drop the auto rows sing-box no longer knows about.
+        const kept = model.standalone.filter(
+            (p) => !this._autoStandalone.has(p.tag) || live.has(p.tag)
+        );
+        const known = new Set(kept.map((p) => p.tag));
+        for (const tag of [...this._autoStandalone]) {
+            if (!live.has(tag)) this._autoStandalone.delete(tag);
+        }
+        for (const proxy of proxies) {
+            const tag = proxy && proxy.tag;
+            if (!tag || tag === SYNTHETIC_GLOBAL) continue;
+            if (groupTags.has(tag) || inGroups.has(tag) || excluded.has(tag)) {
+                continue;
+            }
+            if (known.has(tag)) continue;
+            known.add(tag);
+            kept.push({ tag, pingEntity: null });
+            this._autoStandalone.add(tag);
+        }
+        const before = model.standalone.map((p) => p.tag).join("\n");
+        const after = kept.map((p) => p.tag).join("\n");
+        if (before === after) return false;
+        this._model = {
+            ...model,
+            standalone: kept.sort((a, b) => a.tag.localeCompare(b.tag)),
+        };
+        return true;
+    }
+
+    _livePingsChanged(next) {
+        const prev = this._livePings;
+        if (!prev || prev.size !== next.size) return true;
+        for (const [tag, value] of next) {
+            const old = prev.get(tag);
+            if (
+                !old ||
+                old.delay !== value.delay ||
+                old.failed !== value.failed ||
+                old.test_time !== value.test_time
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    _startStatusTimer() {
+        if (this._statusTimer || !this._statusSupported) return;
+        const interval = this._refreshMs() > 0 ? this._refreshMs() : 2000;
+        const tick = () => {
+            if (!this._statusSupported || this._detached) {
+                this._statusTimer = null;
+                return;
+            }
+            this._statusTimer = setTimeout(() => {
+                this._fetchLivePings();
+                tick();
+            }, Math.max(interval, 1000));
+        };
+        tick();
+    }
+
+    _stopStatusTimer() {
+        if (this._statusTimer) {
+            clearTimeout(this._statusTimer);
+            this._statusTimer = null;
+        }
     }
 
     // -- traffic chart -------------------------------------------------------
@@ -709,6 +958,10 @@ class SingBoxPanelCard extends LitElement {
             }, Math.max(interval, 1000));
         };
         tick();
+        // Live url-test results ride on the same cadence: one timer for the
+        // whole card, no extra polling loop.
+        this._startStatusTimer();
+        this._fetchLivePings();
         // The chart cannot rely on hass pushes: Home Assistant only hands the
         // card a new hass object when a state actually changes, so a quiet
         // link (or a stalled sensor) would leave the chart empty forever.
@@ -740,6 +993,7 @@ class SingBoxPanelCard extends LitElement {
             clearTimeout(this._connPollTimer);
             this._connPollTimer = null;
         }
+        this._stopStatusTimer();
         this._stopChartTimer();
     }
 
@@ -1237,9 +1491,7 @@ class SingBoxPanelCard extends LitElement {
         return html`
             <div class="node">
                 <span class="node-name standalone">${proxy.tag}</span>
-                ${ms !== null
-                    ? html`<span class="ping ${this._pingClass(ms)}">${this._pingText(ms)}</span>`
-                    : ""}
+                ${this._pingChip(ms, proxy.tag)}
                 <button
                     class="node-ping"
                     title=${this._t("pingTitle", { tag: proxy.tag })}
@@ -1249,6 +1501,19 @@ class SingBoxPanelCard extends LitElement {
                     <ha-icon icon="mdi:radar"></ha-icon>
                 </button>
             </div>
+        `;
+    }
+
+    // The ping chip is always drawn: "—" means "never tested" and "✕" means
+    // "the last url-test failed". Hiding the chip made a broken outbound look
+    // exactly like one that was simply never tested, and the only signal left
+    // was the full-screen error dialog this card no longer raises.
+    _pingChip(ping, tag) {
+        return html`
+            <span
+                class="ping ${this._pingClass(ping)}"
+                title=${this._pingTitle(ping, tag)}
+            >${this._pingText(ping)}</span>
         `;
     }
 
@@ -1314,9 +1579,7 @@ class SingBoxPanelCard extends LitElement {
                     @click=${() => this._selectNode(group.tag, option.tag, group.entityId)}
                 >
                     <span class="node-name">${option.tag}</span>
-                    ${ms !== null
-                        ? html`<span class="ping ${this._pingClass(ms)}">${this._pingText(ms)}</span>`
-                        : ""}
+                    ${this._pingChip(ms, option.tag)}
                 </button>
                 <button
                     class="node-ping"

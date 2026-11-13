@@ -45,6 +45,17 @@ const MESSAGES = {
         ru: "Проверить пинг {tag}",
         en: "Check ping of {tag}",
     },
+    // A url-test that failed used to abort the whole action with a huge error
+    // dialog; now the ping sensor only reports the failure (state stays
+    // unknown, last_test_failed: true) and the card marks the chip.
+    pingFailed: {
+        ru: "Тест не прошёл: {tag}",
+        en: "Test failed: {tag}",
+    },
+    pingNone: {
+        ru: "Ещё не проверялся: {tag}",
+        en: "Not tested yet: {tag}",
+    },
     errors: {
         loadFailed: {
             ru: "Не удалось загрузить данные: {msg}",

@@ -271,6 +271,12 @@ export const cardStyles = css`
     .ping.warn { color: #f9a825; }
     .ping.bad { color: var(--error-color, #c62828); }
     .ping.none { color: var(--disabled-text-color); }
+    /* A failed url-test is not "slow", it is broken: same red as .bad but on
+       a tinted background, so the ✕ cannot be mistaken for a high delay. */
+    .ping.fail {
+        color: var(--error-color, #c62828);
+        background: color-mix(in srgb, var(--error-color, #c62828) 14%, transparent);
+    }
 
     /* ---------- states ---------- */
     .state-msg {

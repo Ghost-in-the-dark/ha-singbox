@@ -27,8 +27,15 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from .backend import BACKEND_GRPC
-from .clash import POLL_INTERVAL_SECONDS, ClashApiError, ClashClient, is_auth_error
-from .const import DEFAULT_UPDATE_INTERVAL, DOMAIN
+from .clash import (
+    POLL_INTERVAL_SECONDS,
+    ClashApiError,
+    ClashClient,
+    PingResult,
+    _now_ms,
+    is_auth_error,
+)
+from .const import DEFAULT_HISTORY, DEFAULT_UPDATE_INTERVAL, DOMAIN
 from .errors import SingBoxAuthError, SingBoxNotSupported
 from .grpc import (
     GRPC_STATUS_NOT_FOUND,
@@ -70,6 +77,7 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         client: SingBoxClient | ClashClient,
         backend: str,
         update_interval_seconds: int = DEFAULT_UPDATE_INTERVAL,
+        history_enabled: bool = DEFAULT_HISTORY,
     ) -> None:
         # The update interval is not a push interval: the stream frames drive
         # the data, and this only paces the health poll that also supervises
@@ -87,6 +95,14 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         )
         self.client = client
         self.backend = backend
+        # Whether the entities of this entry write to the recorder. Read by
+        # the sensor platform (to skip new ping entities entirely) and by the
+        # websocket status command (to tell the card where pings come from).
+        self.history_enabled = bool(history_enabled)
+        # Last url-test outcome per outbound tag, backend-neutral. The clash
+        # client fills it itself; on the gRPC backend the coordinator records
+        # the result of url_test() so both expose the same thing.
+        self.last_pings: dict[str, PingResult] = {}
         self.data = SingBoxStatus()
         self._stream_factories: list = []
         self._stream_tasks: list[asyncio.Task] = []
@@ -172,6 +188,27 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             self.data.version = await client.get_version()
         except (TimeoutError, OSError, ConnectionError) as err:
             raise ConnectionError(f"cannot reach sing-box API: {err}") from err
+        # Optional endpoints are probed once: the premium/PDK builds add
+        # /group batch tests and real /rules, upstream 1.14.4 has the former
+        # but not the latter. A build without them keeps working, it just
+        # loses the feature (see clash.detect_capabilities).
+        try:
+            await client.detect_capabilities()
+        except (TimeoutError, OSError, ConnectionError, ClashApiError) as err:
+            _LOGGER.debug("clash API capability probe failed: %s", err)
+        self.data.premium = client.premium
+        self.data.meta = client.meta
+        self.data.rules_available = client.rules_available
+        self.data.group_delay_available = client.group_delay_available
+        # The capabilities probe already established whether /rules answers a
+        # real list (premium) or null (upstream). Reading it once here means a
+        # diagnostics download shows the route set without the user having to
+        # call the refresh_rules service first; failures stay non-fatal.
+        if client.rules_available:
+            try:
+                self.data.rules = await client.get_rules()
+            except (TimeoutError, OSError, ConnectionError, ClashApiError) as err:
+                _LOGGER.debug("route rules unavailable: %s", err)
 
         try:
             mode_list, current = await client.get_configs()
@@ -549,6 +586,16 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         return list(self._connections.values())
 
     @property
+    def rules_available(self) -> bool:
+        """True when the backend can list the route rules (premium builds)."""
+        return bool(self.data.rules_available)
+
+    @property
+    def premium(self) -> bool:
+        """True when /version advertises the premium/PDK clash-API extras."""
+        return bool(self.data.premium)
+
+    @property
     def groups_index(self) -> dict[str, SingBoxGroup]:
         return self._groups_index
 
@@ -572,11 +619,68 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
             raise SingBoxNotSupported("expanding a group is not supported by the clash API backend")
         await self.client.set_group_expand(group_tag, is_expand)
 
-    async def url_test(self, outbound_tag: str, url: str | None = None) -> None:
+    async def url_test(self, outbound_tag: str, url: str | None = None) -> PingResult:
+        """Run a url-test and return its outcome; never raise on a failed test.
+
+        A node that cannot reach the test URL is a normal state of a proxy
+        list, not an integration failure: the service returns the outcome and
+        the card paints that node red, instead of Home Assistant showing the
+        full-screen "Failed to perform the action singbox/url_test" banner.
+        Only authentication and transport errors still propagate.
+        """
         if self.backend == BACKEND_GRPC:
             await self.client.url_test(outbound_tag)
-            return
-        await self.client.url_test(outbound_tag, url)
+            result = PingResult(tag=outbound_tag, test_time=_now_ms())
+        else:
+            result = await self.client.url_test(outbound_tag, url)
+        self.last_pings[result.tag] = result
+        return result
+
+    async def url_test_many(self, tags: list[str], url: str | None = None) -> dict[str, PingResult]:
+        """Test several outbounds, batching through the clash group endpoint."""
+        if self.backend == BACKEND_GRPC:
+            results: dict[str, PingResult] = {}
+            for tag in tags:
+                results[tag] = await self.url_test(tag, url)
+            return results
+        results = await self.client.url_test_many(tags, url)
+        self.last_pings.update(results)
+        return results
+
+    def ping_for(self, tag: str) -> PingResult | None:
+        """Latest known url-test outcome for an outbound tag."""
+        if self.backend == BACKEND_GRPC:
+            return self.last_pings.get(tag)
+        return self.client.last_pings.get(tag) or self.last_pings.get(tag)
+
+    async def reload_config(self, force: bool = True) -> None:
+        """Re-apply the running config (premium builds answer this)."""
+        if self.backend == BACKEND_GRPC:
+            raise SingBoxNotSupported("reloading the config is not supported by the gRPC backend")
+        await self.client.reload_config(force)
+
+    async def flush_fakeip_cache(self) -> None:
+        if self.backend == BACKEND_GRPC:
+            raise SingBoxNotSupported("flushing the fake-IP cache needs the clash API backend")
+        await self.client.flush_fakeip_cache()
+
+    async def flush_dns_cache(self) -> None:
+        if self.backend == BACKEND_GRPC:
+            raise SingBoxNotSupported("flushing the DNS cache needs the clash API backend")
+        await self.client.flush_dns_cache()
+
+    async def refresh_rules(self) -> None:
+        """Re-read the route rules and expose them on the snapshot."""
+        if self.backend == BACKEND_GRPC:
+            raise SingBoxNotSupported("listing route rules needs the clash API backend")
+        self.data.rules = await self.client.get_rules()
+        self.data.rules_available = bool(self.data.rules)
+        self.async_set_updated_data(self.data)
+
+    async def dns_query(self, name: str, record_type: str = "A") -> dict:
+        if self.backend == BACKEND_GRPC:
+            raise SingBoxNotSupported("DNS queries need the clash API backend")
+        return await self.client.dns_query(name, record_type)
 
     async def close_connection(self, connection_id: str) -> None:
         await self.client.close_connection(connection_id)

@@ -389,6 +389,10 @@ class SingBoxGroupItem:
     type: str
     url_test_time: int
     url_test_delay: int
+    # True when the last url-test ran and could not reach the test URL. It is
+    # deliberately distinct from url_test_delay == 0, which means "never
+    # tested": the card paints the former red and the latter as a dash.
+    url_test_failed: bool = False
 
 
 @dataclass
@@ -421,6 +425,17 @@ class SingBoxStatus:
     proxies: list[SingBoxGroupItem] = field(default_factory=list)
     clash_mode_list: list[str] | None = None
     clash_mode: str | None = None
+    # Backend flavour, filled from /version (clash) or the API version (gRPC).
+    # Premium/PDK builds add /group batch tests and real /rules; the flags say
+    # what this particular build actually answered, so the UI can hide what is
+    # not there instead of showing buttons that always fail.
+    premium: bool = False
+    meta: bool = False
+    rules_available: bool | None = None
+    group_delay_available: bool | None = None
+    # Route rules, as reported by the premium builds (/rules). Empty on
+    # upstream sing-box, which answers {"rules": null} there.
+    rules: list[dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

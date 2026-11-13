@@ -39,6 +39,16 @@ Installed from HACS, set up from the UI, no YAML and no extra Python packages.
 - **Recovers on its own** — a dropped stream is restarted with exponential
   backoff, and a rejected secret starts a reauth flow instead of failing
   silently.
+- **Works with upstream and PDK builds** — the `clash_api` extras that only
+  the experimental PDK ("premium") builds expose are detected once and used
+  when present: batched group delay tests, real route rules, fake-IP and DNS
+  cache flushes, DNS queries through sing-box itself and `PUT /configs`.
+  On upstream sing-box those calls report "not supported" instead of failing.
+- **Optional state history** — one ping sensor per outbound is the bulk of
+  what this integration writes to the recorder. Turn history off and the
+  sensors are not created at all; the card reads the same numbers over its own
+  websocket command, so a dashboard looks identical with a fraction of the
+  database traffic.
 - **Diagnostics** — download from Settings → Devices & services → sing-box →
   ⋮ → Download diagnostics when opening an issue.
 
@@ -129,8 +139,20 @@ sing-box → Configure**:
 | Host / Port / API secret / Use TLS | Connection settings; the integration reconnects after saving |
 | Status update interval (1–60 s) | How often sing-box pushes status. Raise it on busy instances |
 | Speed unit (B/s, KiB/s, kB/s, MiB/s, MB/s) | Display unit for the speed sensors. The raw value stays B/s |
+| Write state history | Create the per-outbound ping sensors and record them. On by default |
+| Delete recorded history on save | Options flow only: purge what the recorder already holds for this integration |
 
 The integration reloads automatically when options are saved.
+
+**About state history.** Almost everything this integration sends to the
+recorder comes from the ping sensors: one entity per outbound, a new state on
+every url-test. With a few dozen proxies that is by far the largest table this
+integration grows. Turning the option off stops those sensors from being
+created — speed, memory and connection sensors keep updating normally — and the
+panel card takes the same delays from the `singbox/status` websocket command
+instead of from state history. Nothing on the dashboard changes; only the log
+of past delays disappears. Because Home Assistant has no per-entity "do not
+record" flag, this is the only way to make the choice.
 
 ## Entities
 
@@ -142,7 +164,7 @@ The integration reloads automatically when options are saved.
 | Connections in / out | sensor | Active connections; "out" is unavailable on the clash backend |
 | Uplink / Downlink | sensor | Data rate (B/s), scaled to the unit you pick |
 | Uplink total / Downlink total | sensor | Session totals |
-| \<proxy tag\> Ping | sensor | Last url-test delay in ms, one diagnostic entity per outbound |
+| \<proxy tag\> Ping | sensor | Last url-test delay in ms, one diagnostic entity per outbound; not created when state history is off |
 | \<group tag\> | select | One per selector group. url-test and fallback groups are automatic and cannot be switched |
 | Clash mode | select | Only when the clash API is enabled |
 
@@ -205,11 +227,42 @@ one sing-box instance is configured.
 | Service | Fields | Description |
 |---|---|---|
 | `singbox.select_outbound` | `group_tag`, `outbound_tag` | Select an outbound inside a group |
-| `singbox.url_test` | `outbound_tag`, `url` | Trigger a url-test for a group (`url` is used by the clash backend only) |
+| `singbox.url_test` | `outbound_tag`, `outbound_tags`, `url` | Trigger a url-test, for one node or a whole list (`url` is used by the clash backend only) |
 | `singbox.set_group_expand` | `group_tag`, `is_expand` | Expand or collapse a group (gRPC backend only) |
 | `singbox.close_connection` | `connection_id` | Close one connection |
 | `singbox.close_all_connections` | – | Close all connections |
 | `singbox.set_clash_mode` | `mode` | Switch the clash mode |
+| `singbox.reload_config` | `force` | Ask sing-box to re-apply its config (clash backend) |
+| `singbox.flush_fakeip_cache` | – | Drop the fake-IP cache (clash backend) |
+| `singbox.flush_dns_cache` | – | Drop the DNS cache (clash backend) |
+| `singbox.refresh_rules` | – | Re-read the route rules into diagnostics (clash backend) |
+| `singbox.dns_query` | `name`, `type` | Resolve a name with sing-box's own resolver (clash backend) |
+
+The last five exist because the PDK/"premium" builds expose extra
+`clash_api` endpoints. They are capability-detected at setup: on a build
+without them a service call raises a validation error saying the action is not
+supported, and nothing else breaks.
+
+A url-test that cannot reach its URL is a normal state of a proxy list, not a
+failure: `singbox.url_test` returns the outcome instead of aborting, and the
+card paints the node red.
+
+`singbox.dns_query` is the one service that answers with data, so use
+`response_variable` to consume the record set:
+
+```yaml
+action: singbox.dns_query
+data:
+  name: example.com
+  type: A
+response_variable: answer
+```
+
+A note on `reload_config`: upstream sing-box 1.14.4 answers `204` to
+`PUT /configs` but **does not re-read the config file** — verified on upstream
+1.14.4 and 1.14.4-pdk, an outbound added to the config does not appear after
+the call. The service is kept for forks that do implement the reload, and says
+so in the UI.
 
 ## Update
 
@@ -240,6 +293,13 @@ recorder:
   one in the sing-box config. Saving a new one starts a reauth flow.
 - **Some sensors stay unavailable** — the clash backend cannot provide
   goroutines, connections out, started at or the API version. This is expected.
+- **"not supported by the clash API backend"** — the service you called needs
+  a build that exposes the extra endpoint. Upstream sing-box does not have
+  `/rules` or `/dns/query`; the PDK builds do. Capability detection runs at
+  setup, and diagnostics shows which extras the build answered.
+- **Ping sensors are missing** — the `Write state history` option is off, so
+  they are not created on purpose. The card still shows live delays; re-enable
+  the option if you want the entity history back.
 - **The card says the connection list is unavailable** — the sing-box build does
   not expose connection tracking. Everything else on the card keeps working.
 - **The card does not appear** — check that the integration is loaded, then

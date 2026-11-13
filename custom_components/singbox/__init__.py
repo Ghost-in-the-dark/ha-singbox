@@ -9,12 +9,13 @@ selectors.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryError,
@@ -29,7 +30,9 @@ from homeassistant.helpers.typing import ConfigType
 from .backend import detect_backend
 from .clash import ClashApiError, is_auth_error
 from .const import (
+    CONF_HISTORY,
     CONF_UPDATE_INTERVAL,
+    DEFAULT_HISTORY,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     PLATFORMS,
@@ -50,6 +53,13 @@ SERVICE_NAMES = (
     "close_connection",
     "close_all_connections",
     "set_clash_mode",
+    # Premium/PDK builds only; each one reports "not supported" on upstream
+    # instead of failing with an HTTP error.
+    "reload_config",
+    "flush_fakeip_cache",
+    "flush_dns_cache",
+    "refresh_rules",
+    "dns_query",
 )
 
 
@@ -82,6 +92,7 @@ def _async_register_websocket_api(hass: HomeAssistant) -> None:
     if hass.data.get(DATA_WS_REGISTERED):
         return
     websocket_api.async_register_command(hass, ws_connections)
+    websocket_api.async_register_command(hass, ws_status)
     hass.data[DATA_WS_REGISTERED] = True
 
 
@@ -153,6 +164,92 @@ async def ws_connections(
     )
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "singbox/status",
+        vol.Optional("entry_id"): cv.string,
+    }
+)
+@websocket_api.async_response
+async def ws_status(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return the live status the panel card needs, without the recorder.
+
+    The card used to read its pings from the ping sensor entities, which
+    meant the integration had to create one sensor per outbound and write a
+    state for each of them on every url-test - the single biggest source of
+    recorder rows this integration produces. With history turned off those
+    sensors are not created, so the card reads this command instead: same
+    numbers, no database traffic, and the answer is always current.
+
+    Payload::
+
+        {
+          "version": "1.14.4", "premium": true, "history_enabled": false,
+          "group_delay_available": true, "rules_available": true,
+          "groups": [{"tag": "...", "type": "Selector", "selectable": true,
+                      "selected": "...", "items": ["..."]}],
+          "proxies": [{"tag": "...", "type": "VLESS", "delay": 152,
+                       "test_time": 1730000000000, "failed": false}]
+        }
+
+    ``failed`` separates "the test ran and could not reach the URL" from
+    "never tested" (delay 0, failed false): the card paints the first red and
+    the second as a neutral dash.
+    """
+    try:
+        coordinator = _select_coordinator(hass, msg.get("entry_id"))
+    except ConfigEntryError as err:
+        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, str(err))
+        return
+    data = coordinator.data
+    proxies = []
+    for proxy in data.proxies:
+        ping = coordinator.ping_for(proxy.tag)
+        failed = bool(proxy.url_test_failed or (ping and ping.failed))
+        delay = proxy.url_test_delay
+        test_time = proxy.url_test_time
+        if ping is not None:
+            test_time = ping.test_time or test_time
+            if ping.failed:
+                delay = 0
+            elif ping.delay > 0:
+                delay = ping.delay
+        proxies.append(
+            {
+                "tag": proxy.tag,
+                "type": proxy.type,
+                "delay": delay,
+                "test_time": test_time,
+                "failed": failed,
+            }
+        )
+    connection.send_result(
+        msg["id"],
+        {
+            "version": data.version,
+            "premium": coordinator.premium,
+            "history_enabled": coordinator.history_enabled,
+            "group_delay_available": bool(data.group_delay_available),
+            "rules_available": bool(data.rules_available),
+            "groups": [
+                {
+                    "tag": group.tag,
+                    "type": group.type,
+                    "selectable": group.selectable,
+                    "selected": group.selected,
+                    "items": [item.tag for item in group.items],
+                }
+                for group in data.groups
+            ],
+            "proxies": proxies,
+        },
+    )
+
+
 def _translate_setup_error(err: Exception) -> Exception:
     """Map a setup failure to the exception Home Assistant understands.
 
@@ -188,6 +285,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
         )
     )
+    history_enabled = bool(
+        entry.options.get(CONF_HISTORY, entry.data.get(CONF_HISTORY, DEFAULT_HISTORY))
+    )
     session = async_get_clientsession(hass)
     # Backend detection must run inside the try block: it performs the first
     # network call, so an unreachable host or a wrong secret surfaces here
@@ -198,7 +298,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         client, backend = await detect_backend(host, port, secret, use_tls, session)
         coordinator = SingBoxCoordinator(
-            hass, entry, client, backend, update_interval_seconds=update_interval
+            hass,
+            entry,
+            client,
+            backend,
+            update_interval_seconds=update_interval,
+            history_enabled=history_enabled,
         )
         await coordinator.async_setup()
     except Exception as err:
@@ -269,8 +374,15 @@ async def _async_setup_services(hass: HomeAssistant, entry: ConfigEntry) -> None
             await coordinator.select_outbound(call.data["group_tag"], call.data["outbound_tag"])
 
     async def _url_test(call: ServiceCall) -> None:
+        # Accepts one tag or a list, so the card can refresh a whole group in
+        # a single service call (the batch endpoint tests every member at
+        # once instead of one round trip per node).
         for coordinator in _entries(call):
-            await coordinator.url_test(call.data["outbound_tag"], call.data.get("url"))
+            tags = call.data.get("outbound_tags") or [call.data.get("outbound_tag")]
+            tags = [tag for tag in tags if tag]
+            if not tags:
+                raise ServiceValidationError("outbound_tag or outbound_tags is required")
+            await coordinator.url_test_many(tags, call.data.get("url"))
 
     async def _set_group_expand(call: ServiceCall) -> None:
         for coordinator in _entries(call):
@@ -289,9 +401,13 @@ async def _async_setup_services(hass: HomeAssistant, entry: ConfigEntry) -> None
             await coordinator.set_clash_mode(call.data["mode"])
 
     def _wrap(fn):
-        async def _inner(call: ServiceCall) -> None:
+        async def _inner(call: ServiceCall):
+            # Returns whatever the handler returns: dns_query answers with the
+            # DNS response and the caller consumes it through response_variable.
+            # Swallowing the value (the previous behaviour) made that service
+            # impossible to use at all.
             try:
-                await fn(call)
+                return await fn(call)
             except SingBoxNotSupported as err:
                 raise ServiceValidationError(str(err)) from err
             except SingBoxAuthError as err:
@@ -307,13 +423,59 @@ async def _async_setup_services(hass: HomeAssistant, entry: ConfigEntry) -> None
 
         return _inner
 
+    async def _reload_config(call: ServiceCall) -> None:
+        for coordinator in _entries(call):
+            await coordinator.reload_config(force=bool(call.data.get("force", True)))
+
+    async def _flush_fakeip_cache(call: ServiceCall) -> None:
+        for coordinator in _entries(call):
+            await coordinator.flush_fakeip_cache()
+
+    async def _flush_dns_cache(call: ServiceCall) -> None:
+        for coordinator in _entries(call):
+            await coordinator.flush_dns_cache()
+
+    async def _refresh_rules(call: ServiceCall) -> None:
+        for coordinator in _entries(call):
+            await coordinator.refresh_rules()
+
+    async def _dns_query(call: ServiceCall) -> dict[str, Any]:
+        # A DNS query is a *question*: running it and throwing the answer away
+        # (the previous behaviour) made the service pointless, since the only
+        # thing it could produce was an empty success. Returning the record set
+        # makes it usable from Developer Tools and from automations
+        # (response_variable), and it is why the service is registered with
+        # SupportsResponse.ONLY-friendly semantics below.
+        results: dict[str, Any] = {}
+        for coordinator in _entries(call):
+            results[coordinator.config_entry.entry_id] = await coordinator.dns_query(
+                call.data["name"], call.data.get("type", "A")
+            )
+        entries = list(results.values())
+        return entries[0] if len(entries) == 1 else results
+
     services = {
         "select_outbound": (_select_outbound, {"group_tag": cv.string, "outbound_tag": cv.string}),
-        "url_test": (_url_test, {"outbound_tag": cv.string, vol.Optional("url"): cv.url}),
+        "url_test": (
+            _url_test,
+            {
+                vol.Optional("outbound_tag"): cv.string,
+                vol.Optional("outbound_tags"): vol.All(cv.ensure_list, [cv.string]),
+                vol.Optional("url"): cv.url,
+            },
+        ),
         "set_group_expand": (_set_group_expand, {"group_tag": cv.string, "is_expand": cv.boolean}),
         "close_connection": (_close_connection, {"connection_id": cv.string}),
         "close_all_connections": (_close_all_connections, {}),
         "set_clash_mode": (_set_clash_mode, {"mode": cv.string}),
+        "reload_config": (_reload_config, {vol.Optional("force"): cv.boolean}),
+        "flush_fakeip_cache": (_flush_fakeip_cache, {}),
+        "flush_dns_cache": (_flush_dns_cache, {}),
+        "refresh_rules": (_refresh_rules, {}),
+        "dns_query": (
+            _dns_query,
+            {vol.Required("name"): cv.string, vol.Optional("type"): cv.string},
+        ),
     }
     for name, (handler, fields) in services.items():
         # These are config-entry level services, not entity services: do not
@@ -322,6 +484,13 @@ async def _async_setup_services(hass: HomeAssistant, entry: ConfigEntry) -> None
         # ALLOW_EXTRA keeps compatibility with callers that still pass an
         # entity_id target (e.g. the panel card) — a plain vol.Schema would
         # reject them with "extra keys not allowed".
+        # dns_query is the one service that answers with data: it is a
+        # question, so it is registered with a response and callers use
+        # response_variable. Everything else is a command and stays quiet.
         hass.services.async_register(
-            DOMAIN, name, _wrap(handler), schema=vol.Schema(fields, extra=vol.ALLOW_EXTRA)
+            DOMAIN,
+            name,
+            _wrap(handler),
+            schema=vol.Schema(fields, extra=vol.ALLOW_EXTRA),
+            supports_response=SupportsResponse.OPTIONAL if name == "dns_query" else None,
         )

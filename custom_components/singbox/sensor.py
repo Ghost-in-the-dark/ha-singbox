@@ -20,6 +20,7 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -215,11 +216,20 @@ class SingBoxPingSensor(CoordinatorEntity[SingBoxCoordinator], SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         proxy = self.proxy
-        if proxy is None or proxy.url_test_time <= 0:
+        if proxy is None:
             return {}
-        return {
-            "last_checked": datetime.fromtimestamp(proxy.url_test_time / 1000, tz=UTC).isoformat()
-        }
+        attributes: dict[str, Any] = {}
+        if proxy.url_test_time > 0:
+            attributes["last_checked"] = datetime.fromtimestamp(
+                proxy.url_test_time / 1000, tz=UTC
+            ).isoformat()
+        # A failed test is a real answer and has to be distinguishable from
+        # "never tested": both end up with state None (no delay to report,
+        # and a numeric 0 would lie about the ping), so the flag is what the
+        # card paints red. Only present when there is something to say.
+        if proxy.url_test_failed:
+            attributes["last_test_failed"] = True
+        return attributes
 
     @property
     def available(self) -> bool:
@@ -232,19 +242,86 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: SingBoxCoordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # The status sensors are gauges: a handful of them, updating on the
+    # configured interval. They are created either way.
     async_add_entities(
         SingBoxSensor(coordinator, description, _SENSOR_ATTRS[description.key])
         for description in SENSOR_DESCRIPTIONS
     )
 
+    # The ping sensors are a different animal: one per outbound (a few dozen
+    # on a realistic subscription), each written on every url-test. They are
+    # what makes the recorder grow, and they are also the reason the card
+    # used to be the only place that knew a test had failed.
+    #
+    # With history enabled they are created exactly as before - the card and
+    # every existing dashboard keep reading them, so nothing changes for
+    # current users. With history disabled they are not created at all: the
+    # card gets the same numbers from the singbox/status websocket command
+    # (which reads the coordinator, not the recorder), so the only thing that
+    # is lost is the log of past delays - which is precisely what the option
+    # promises, because Home Assistant has no per-entity "do not record" flag
+    # (see the HISTORY option documentation).
+    if not coordinator.history_enabled:
+        _LOGGER.debug("state history is disabled; not creating ping sensors")
+        return
+
     # Proxies are discovered dynamically: sing-box may add outbounds (or the
     # group stream may deliver them later), and entities for the ones known at
     # setup time only would otherwise require a Home Assistant restart.
+    # Seed the known set from the entity registry, not from an empty set.
+    # Starting empty made the stale sweep below useless after a restart: the
+    # sensors created by a previous run are in the registry but never in
+    # "known", so a tag that disappeared while Home Assistant was down left
+    # its entity in the registry forever (state unavailable). That is exactly
+    # the pile of orphaned sing_box_*_out sensors a subscription change leaves
+    # behind, and it survived every restart.
+    # Two different sets, and they must not be confused:
+    #
+    # * "known" is what this run of the platform has created. Entities are
+    #   objects owned by the platform, so an entity that a previous run put in
+    #   the registry still has to be created again here - seeding "known" from
+    #   the registry made every ping sensor skip creation on restart and left
+    #   the whole set permanently unavailable.
+    # * "previous" is what the registry says existed. It is only used to find
+    #   tags that disappeared from the server while Home Assistant was down,
+    #   which otherwise leave an unavailable entity behind forever.
     known: set[str] = set()
+    unique_prefix = f"{coordinator.config_entry.entry_id}_ping_"
+    entity_registry = er.async_get(hass)
+    previous: set[str] = set()
+    for registry_entry in er.async_entries_for_config_entry(
+        entity_registry, coordinator.config_entry.entry_id
+    ):
+        if registry_entry.domain != "sensor" or not registry_entry.unique_id.startswith(
+            unique_prefix
+        ):
+            continue
+        previous.add(registry_entry.unique_id[len(unique_prefix) :])
 
     @callback
     def _add_new_proxies() -> None:
-        new_tags = [proxy.tag for proxy in coordinator.data.proxies if proxy.tag not in known]
+        # A proxy that disappears from the server must disappear from Home
+        # Assistant too. Previously only additions were handled, so every
+        # subscription refresh that dropped or renamed an outbound left a
+        # permanently "unavailable" sensor behind - one dead entity per removed
+        # node, forever, with the old unique_id blocking a clean recreation if
+        # the tag ever came back.
+        current = {proxy.tag for proxy in coordinator.data.proxies}
+        # Only tags the registry knows about can have a stale entity to drop;
+        # anything this run created is in "known" and is handled below.
+        stale = (previous - current) - known
+        if stale:
+            previous.difference_update(stale)
+            _LOGGER.debug("removing ping sensors for %s", ", ".join(sorted(stale)))
+            # Keep the entity registry in step with what the server reports.
+            for tag in stale:
+                unique_id = f"{coordinator.config_entry.entry_id}_ping_{tag}"
+                entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+                if entity_id is not None:
+                    entity_registry.async_remove(entity_id)
+        new_tags = [tag for tag in current if tag not in known]
         if not new_tags:
             return
         known.update(new_tags)

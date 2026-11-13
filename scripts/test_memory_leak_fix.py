@@ -51,6 +51,10 @@ def _stub_homeassistant() -> None:
 
     core = types.ModuleType("homeassistant.core")
     core.HomeAssistant = object
+    # coordinator.py imports the @callback decorator; without it the module
+    # fails to import at all and the whole regression script dies before it
+    # reaches a single check.
+    core.callback = lambda func: func
     sys.modules["homeassistant.core"] = core
 
     helpers = types.ModuleType("homeassistant.helpers")
@@ -77,7 +81,11 @@ def _stub_homeassistant() -> None:
         def async_update_listeners(self):
             pass
 
+    class UpdateFailed(Exception):
+        pass
+
     uc.DataUpdateCoordinator = DataUpdateCoordinator
+    uc.UpdateFailed = UpdateFailed
     sys.modules["homeassistant.helpers.update_coordinator"] = uc
 
     const = types.ModuleType("homeassistant.const")
@@ -261,9 +269,13 @@ def _make_old_package(tmp: Path) -> Path:
     pkg.mkdir()
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     (pkg / "clash.py").write_text(old_src, encoding="utf-8")
-    (pkg / "grpc.py").write_text(
-        (PKG_DIR / "grpc.py").read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    # clash.py and grpc.py import the shared exception module, so it has to be
+    # copied as well; without it the probe dies on ModuleNotFoundError instead
+    # of reproducing the busy loop.
+    for name in ("grpc.py", "errors.py"):
+        (pkg / name).write_text(
+            (PKG_DIR / name).read_text(encoding="utf-8"), encoding="utf-8"
+        )
     return pkg
 
 

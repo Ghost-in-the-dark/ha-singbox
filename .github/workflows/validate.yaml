@@ -46,3 +46,6 @@ jobs:
       - run: python -m pytest tests
       # The transport regressions only need aiohttp.
       - run: python scripts/test_regressions.py
+      # Reproduces the v0.3.13 shutdown busy loop in a subprocess: the pre-fix
+      # code must spin without ending, the shipped code must raise at once.
+      - run: python scripts/test_memory_leak_fix.py

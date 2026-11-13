@@ -9,7 +9,8 @@
           "port": "Port",
           "password": "API secret",
           "ssl": "Use TLS (https)",
-          "update_interval": "Status update interval"
+          "update_interval": "Status update interval",
+          "history": "Write state history"
         }
       },
       "reauth_confirm": {
@@ -33,13 +34,15 @@
     "step": {
       "init": {
         "title": "sing-box options",
-        "description": "Change the connection settings or the status update interval. The integration reloads automatically after saving.",
+        "description": "Change the connection settings, the status update interval or whether state history is written to the recorder. With history turned off the sensors still update, but nothing is recorded for this integration's entities.",
         "data": {
           "host": "Host",
           "port": "Port",
           "password": "API secret",
           "ssl": "Use TLS (https)",
-          "update_interval": "Status update interval"
+          "update_interval": "Status update interval",
+          "history": "Write state history",
+          "purge_history": "Delete recorded history on save"
         }
       }
     },
@@ -88,6 +91,28 @@
       "clash_mode": {
         "name": "Clash mode"
       }
+    }
+  },
+  "services": {
+    "reload_config": {
+      "name": "Reload config",
+      "description": "Asks sing-box to re-apply its configuration over the clash API (PUT /configs). Upstream sing-box accepts the request and answers 204 but does not re-read the config file: verified on 1.14.4 and 1.14.4-pdk, an outbound added to the file does not appear after the call. The service is kept for forks and builds that implement the reload. Needs the clash API backend; on the gRPC backend it reports that the action is not supported."
+    },
+    "flush_fakeip_cache": {
+      "name": "Flush fake-IP cache",
+      "description": "Drops the fake-IP cache of sing-box (POST /cache/fakeip/flush). Needs the clash API backend and a build that exposes the endpoint; on the gRPC backend it reports that the action is not supported. A server without a fake-IP inbound still answers 204."
+    },
+    "flush_dns_cache": {
+      "name": "Flush DNS cache",
+      "description": "Drops the DNS cache of sing-box (POST /cache/dns/flush). Needs the clash API backend and a build that exposes the endpoint; on the gRPC backend it reports that the action is not supported. A server without a cache file still answers 204."
+    },
+    "refresh_rules": {
+      "name": "Refresh rules",
+      "description": "Re-reads the route rules through the sing-box API (GET /rules) and stores them in the integration snapshot, where diagnostics shows them. Upstream sing-box publishes no rules and answers with an empty list; builds such as 1.14.4-pdk return the real rules, and an empty answer is not an error. Needs the clash API backend; on the gRPC backend it reports that the action is not supported."
+    },
+    "dns_query": {
+      "name": "DNS query",
+      "description": "Resolves a name with the DNS resolver of sing-box itself (GET /dns/query) and returns the answer to the caller through a response variable. The server picks the DNS server and the outbound by its own route rules, so the answer can differ from a query sent by the host. Needs the clash API backend; on the gRPC backend it reports that the action is not supported."
     }
   }
 }
