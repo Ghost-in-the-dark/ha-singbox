@@ -236,6 +236,76 @@ class SingBoxPingSensor(CoordinatorEntity[SingBoxCoordinator], SensorEntity):
         return super().available and self.proxy is not None
 
 
+class SingBoxOutboundTrafficSensor(CoordinatorEntity[SingBoxCoordinator], SensorEntity):
+    """Per-outbound traffic rate taken from the coordinator's traffic sample.
+
+    sing-box has no per-outbound counter endpoint: the clash API reports the
+    connection list, and every connection carries the outbound chain plus its
+    own byte counters. The coordinator turns those into bytes/second per tag
+    (see SingBoxCoordinator.outbound_traffic), so one sensor can show the live
+    rate of a single node without the card having to poll anything.
+
+    Two sensors per tag (up and down) rather than one with two attributes: a
+    sensor with a single numeric state is what dashboards, statistics and the
+    recorder actually use, and the attributes are still there for the card.
+
+    History: these are exactly the entities that would flood the recorder -
+    one row per outbound per second - so when state history is disabled they
+    are not created at all, the same rule the ping sensors follow.
+    """
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.DATA_RATE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfDataRate.BYTES_PER_SECOND
+    _attr_suggested_unit_of_measurement = UnitOfDataRate.KIBIBYTES_PER_SECOND
+
+    def __init__(self, coordinator: SingBoxCoordinator, tag: str, direction: str) -> None:
+        super().__init__(coordinator)
+        self._tag = tag
+        self._direction = direction
+        up = direction == "up"
+        self.entity_description = SensorEntityDescription(
+            key=f"outbound_{direction}",
+            translation_key=f"outbound_{direction}",
+            icon="mdi:upload-network-outline" if up else "mdi:download-network-outline",
+        )
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_out_{direction}_{tag}"
+        # The tag goes into the translated name instead of replacing it: a
+        # bare tag would collide with the ping sensor of the same outbound
+        # (both would be named "telaga-out" and the second one would land at
+        # "_2"), and would read as a delay rather than a speed.
+        self._attr_translation_placeholders = {"outbound": tag}
+        self._attr_device_info = device_info(coordinator)
+
+    @property
+    def _rate(self) -> tuple[int, int]:
+        return self.coordinator.outbound_traffic.get(self._tag, (0, 0))
+
+    @property
+    def native_value(self) -> int | None:
+        if not self.coordinator.outbound_traffic_available:
+            return None
+        return self._rate[0] if self._direction == "up" else self._rate[1]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        up, down = self._rate
+        return {
+            "outbound": self._tag,
+            "total_rate": up + down,
+            "sampled_at": self.coordinator.outbound_traffic_sampled_at,
+        }
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available
+            and self.coordinator.outbound_traffic_available
+            and self.coordinator.has_outbound_traffic(self._tag)
+        )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -334,3 +404,48 @@ async def async_setup_entry(
     _add_new_proxies()
     coordinator.async_add_discovery_listener(_add_new_proxies)
     entry.async_on_unload(lambda: coordinator.async_remove_discovery_listener(_add_new_proxies))
+
+    # Per-outbound traffic rates, one up + one down sensor per outbound tag.
+    # Kept apart from the ping sensors on purpose: their listener watches the
+    # traffic sample, not the proxy list, so a busy connection does not
+    # trigger a proxy sweep (and a subscription change does not reset the
+    # traffic entities). They are created at this point of the function, so
+    # the history check above already returned when the recorder is off: one
+    # row per outbound per second is the single worst thing this integration
+    # could write.
+    traffic_known: set[str] = set()
+
+    @callback
+    def _add_new_traffic() -> None:
+        if not coordinator.outbound_traffic_available:
+            # No sample yet (or a backend that cannot report it). Existing
+            # entities stay in place: they flip unavailable on their own and
+            # come back when the sample does.
+            return
+        current = set(coordinator.outbound_tags())
+        stale = (traffic_known & set(coordinator.outbound_traffic)) - current
+        if stale:
+            traffic_known.difference_update(stale)
+            for tag in stale:
+                for direction in ("up", "down"):
+                    unique_id = f"{coordinator.config_entry.entry_id}_out_{direction}_{tag}"
+                    entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+                    if entity_id is not None:
+                        entity_registry.async_remove(entity_id)
+        new_tags = [tag for tag in current if tag not in traffic_known]
+        if not new_tags:
+            return
+        traffic_known.update(new_tags)
+        _LOGGER.debug("adding outbound traffic sensors for %s", ", ".join(new_tags))
+        async_add_entities(
+            (
+                SingBoxOutboundTrafficSensor(coordinator, tag, direction)
+                for tag in new_tags
+                for direction in ("up", "down")
+            ),
+            update_before_add=False,
+        )
+
+    _add_new_traffic()
+    coordinator.async_add_traffic_listener(_add_new_traffic)
+    entry.async_on_unload(lambda: coordinator.async_remove_traffic_listener(_add_new_traffic))

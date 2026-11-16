@@ -226,6 +226,16 @@ export const cardStyles = css`
         color: var(--primary-text-color);
         font-family: inherit;
     }
+    /* Tag + per-outbound rate stack: the tag stays on one line (ellipsis) and
+       the rate sits underneath it, so a long tag never pushes the chip out. */
+    .node-label {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 1px;
+        min-width: 0;
+        text-align: left;
+    }
     .node-name {
         max-width: 180px;
         overflow: hidden;
@@ -233,7 +243,34 @@ export const cardStyles = css`
         white-space: nowrap;
     }
     .node-name.standalone {
-        padding: 6px 0 6px 11px;
+        padding: 6px 0 0 11px;
+    }
+    /* Rate of one outbound: "↓ 1,2 KiB/s ↑ 340 B/s". Neutral colours and a
+       small tabular face keep a busy node list from turning into confetti. */
+    .node-rate {
+        display: inline-flex;
+        gap: 6px;
+        max-width: 180px;
+        overflow: hidden;
+        font-size: 11px;
+        line-height: 1.2;
+        color: var(--secondary-text-color);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+    }
+    .node-rate.idle {
+        opacity: 0.45;
+    }
+    .node-rate .rate-dir {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+    }
+    .node-rate .rate-dir.down {
+        color: var(--primary-color);
+    }
+    .node.standalone-node .node-label {
+        padding-bottom: 6px;
     }
     .node-ping {
         display: inline-flex;
@@ -389,6 +426,101 @@ export const cardStyles = css`
         font-size: 12px;
         color: var(--disabled-text-color);
         pointer-events: none;
+    }
+
+    /* ---------- per-outbound traffic ---------- */
+    /* Sits between the group list and the connections, i.e. directly under
+       the nodes whose rates it summarises. Hidden entirely when the running
+       integration does not answer the traffic part of singbox/status. */
+    .traffic {
+        margin-top: 14px;
+        border-top: 1px solid var(--divider-color, rgba(0, 0, 0, 0.12));
+        padding-top: 12px;
+    }
+    .traffic-head {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin-bottom: 8px;
+    }
+    .traffic-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--primary-text-color);
+    }
+    /* The total is the sum of the rows below — not the sing-box-wide traffic
+       in the speed tiles, so it keeps its own subdued style. */
+    .traffic-total {
+        margin-left: auto;
+        display: inline-flex;
+        align-items: baseline;
+        gap: 5px;
+        font-size: 12px;
+        color: var(--secondary-text-color);
+        font-variant-numeric: tabular-nums;
+    }
+    .traffic-total b {
+        font-size: 13px;
+        color: var(--primary-text-color);
+    }
+    .traffic-rows {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .traffic-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 4px 10px;
+        font-size: 12px;
+    }
+    /* One grid cell per row: tag + numbers on the first line, the bar spans
+       both columns underneath it. */
+    .traffic-row .traffic-tag {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--primary-text-color);
+    }
+    .traffic-row .traffic-numbers {
+        display: inline-flex;
+        gap: 8px;
+        font-variant-numeric: tabular-nums;
+        color: var(--secondary-text-color);
+        white-space: nowrap;
+    }
+    .traffic-row .traffic-numbers .rate-dir.down {
+        color: var(--primary-color);
+    }
+    .traffic-row .traffic-bar {
+        grid-column: 1 / -1;
+        height: 5px;
+        border-radius: 3px;
+        overflow: hidden;
+        background: var(--secondary-background-color, rgba(0, 0, 0, 0.06));
+    }
+    .traffic-row .traffic-bar i {
+        display: block;
+        height: 100%;
+        width: 0;
+        border-radius: 3px;
+        /* Width is set in place (style.width) so a 1 Hz refresh never needs a
+           new render; keep the change smooth without animating every frame. */
+        transition: width 0.25s ease;
+        background: linear-gradient(
+            90deg,
+            var(--primary-color),
+            var(--success-color, #2e7d32)
+        );
+    }
+    .traffic-row.idle .traffic-tag {
+        color: var(--secondary-text-color);
+    }
+    .traffic-empty {
+        font-size: 12px;
+        color: var(--disabled-text-color);
     }
 
     /* ---------- connections ---------- */

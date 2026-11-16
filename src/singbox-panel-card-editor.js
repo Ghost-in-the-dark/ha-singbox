@@ -28,6 +28,7 @@ const SECTIONS = [
     "show_chart",
     "show_totals",
     "show_groups",
+    "show_traffic",
     "show_connections",
 ];
 

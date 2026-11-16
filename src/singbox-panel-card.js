@@ -11,7 +11,7 @@ import {
     sortConnections,
 } from "./singbox-panel-connections.js";
 
-const CARD_VERSION = "0.1.18";
+const CARD_VERSION = "0.1.19";
 
 // unique_id formats used by the ha-singbox integration:
 //   select: "{entry_id}_group_{group_tag}"
@@ -45,6 +45,14 @@ function isPingFailed(value) {
     return Boolean(value && typeof value === "object" && value.failed === true);
 }
 
+// Width of a traffic bar in percent, scaled against the largest row of the
+// block so the top entry always fills it. An outbound that carries traffic
+// keeps a visible sliver instead of collapsing into a zero-width line.
+function trafficShare(sum, max) {
+    if (!(max > 0) || !(sum > 0)) return 0;
+    return Math.max(2, Math.round((sum / max) * 100));
+}
+
 // Traffic chart: how many samples the ring buffer holds and how far back the
 // window spans. One sample per hass push (the integration pushes about once a
 // second), so 300 samples cover roughly five minutes at full rate and are
@@ -53,6 +61,12 @@ const CHART_MAX_SAMPLES = 300;
 const CHART_WINDOW_MS = 5 * 60 * 1000;
 // Minimum spacing between two chart samples (Home Assistant pushes faster).
 const CHART_MIN_SAMPLE_MS = 900;
+
+// How many outbounds the "Traffic by outbound" block lists. A busy sing-box has
+// more outbounds than anybody wants to read at 1 Hz, and the tail is always
+// close to zero — the block exists to answer "what is eating the bandwidth",
+// so five rows (and the total above them) say everything.
+const TRAFFIC_TOP_N = 5;
 
 class SingBoxPanelCard extends LitElement {
     // _hass is intentionally NOT a reactive property: HA hands us a fresh
@@ -117,6 +131,17 @@ class SingBoxPanelCard extends LitElement {
         this._statusSupported = true;
         this._statusFetchInFlight = false;
         this._statusTimer = null;
+        // Per-outbound traffic rates from the same singbox/status answer:
+        // proxy tag -> { up, down } in bytes per second, plus the moment the
+        // sample was taken. An integration older than the traffic contract
+        // simply omits the key, and everything below stays empty — the block
+        // and the rate lines are then not drawn at all.
+        this._traffic = new Map();
+        // Real link speed over connections, when the backend reports it; the
+        // header uses it instead of the overlapping per-tag sum.
+        this._trafficTotal = null;
+        this._trafficAt = 0;
+        this._trafficAvailable = false;
         // The status timer must also stop when the card is detached while a
         // request is in flight, otherwise the callback would reschedule it and
         // the card would poll forever outside the DOM.
@@ -132,6 +157,7 @@ class SingBoxPanelCard extends LitElement {
             show_chart: true,
             show_groups: true,
             show_connections: true,
+            show_traffic: true,
             exclude_outbounds: [],
             update_interval: 0,
             language: "auto",
@@ -155,6 +181,7 @@ class SingBoxPanelCard extends LitElement {
             show_chart: true,
             show_groups: true,
             show_connections: true,
+            show_traffic: true,
             exclude_outbounds: [],
             update_interval: 0,
             language: "auto",
@@ -169,6 +196,7 @@ class SingBoxPanelCard extends LitElement {
             "show_chart",
             "show_groups",
             "show_connections",
+            "show_traffic",
         ]) {
             next[key] = next[key] !== false;
         }
@@ -216,6 +244,15 @@ class SingBoxPanelCard extends LitElement {
 
     getCardSize() {
         return 4;
+    }
+
+    // After every paint: the rates in the freshly rendered nodes are almost
+    // always newer than the values the render itself could see (the status
+    // answer arrives between two paints), so write them once more. This is the
+    // only place a rate is written outside the status tick, and it keeps a
+    // throttled card from showing the numbers of the previous render.
+    updated() {
+        this._patchTrafficRates();
     }
 
     get hass() {
@@ -608,6 +645,187 @@ class SingBoxPanelCard extends LitElement {
         return `${scaled.toLocaleString(undefined, { maximumFractionDigits: digits })} ${units[idx]}`;
     }
 
+    // -- per-outbound traffic rates ------------------------------------------
+
+    // One rate in bytes/second, humanized exactly like the sensor values
+    // ("1,2 KiB/s", "340 B/s"). The unit is kilo = 1024, so the numbers line up
+    // with the integration's own traffic sensors and the card's byte totals.
+    _formatRate(bytes) {
+        const value = Number(bytes);
+        if (!Number.isFinite(value) || value < 0) return "—";
+        const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+        let scaled = value;
+        let idx = 0;
+        while (scaled >= 1024 && idx < units.length - 1) {
+            scaled /= 1024;
+            idx += 1;
+        }
+        const digits = idx ? 1 : 0;
+        return `${scaled.toLocaleString(undefined, {
+            maximumFractionDigits: digits,
+        })} ${units[idx]}/s`;
+    }
+
+    // Rate of one outbound tag, or null when the running integration reports
+    // no traffic at all (old version) or does not know this tag.
+    _trafficOf(tag) {
+        if (!this._trafficAvailable || !tag) return null;
+        return this._traffic.get(tag) || null;
+    }
+
+    // Reads the traffic part of a singbox/status answer into
+    //   this._traffic     tag -> { up, down } (bytes/second)
+    //   this._trafficAt   when the sample was produced
+    // and returns true when any of it changed. A missing key (integration
+    // before the traffic contract) or available: false (gRPC backend) clears
+    // the state and reports "no traffic", which hides every rate in the card.
+    _applyTraffic(res) {
+        const traffic = res && res.traffic;
+        const raw =
+            traffic && traffic.available !== false && traffic.outbounds
+                ? traffic.outbounds
+                : null;
+        const next = new Map();
+        if (raw && typeof raw === "object") {
+            for (const [tag, rate] of Object.entries(raw)) {
+                if (!tag || !rate || typeof rate !== "object") continue;
+                const up = Number(rate.up);
+                const down = Number(rate.down);
+                next.set(tag, {
+                    up: Number.isFinite(up) && up > 0 ? up : 0,
+                    down: Number.isFinite(down) && down > 0 ? down : 0,
+                });
+            }
+        }
+        // A connection belongs to every outbound of its chain (proxy, group,
+        // final node), so the per-tag numbers overlap and adding them up
+        // multiplies the real link speed by the chain length. The backend
+        // therefore reports the true total separately; it wins whenever it is
+        // present, and only an older answer without it falls back to the sum.
+        const total = this._parseTrafficTotal(traffic && traffic.total);
+        const available = next.size > 0;
+        const at = Number(traffic && traffic.now ? Date.parse(traffic.now) : 0);
+        const changed =
+            available !== this._trafficAvailable ||
+            this._trafficTotalChanged(total) ||
+            this._trafficChanged(next);
+        this._traffic = next;
+        this._trafficTotal = total;
+        this._trafficAvailable = available;
+        this._trafficAt = Number.isFinite(at) && at > 0 ? at : Date.now();
+        return changed;
+    }
+
+    // { up, down } in bytes/second, or null when the answer carries no usable
+    // total (old integration, or a backend that only reports per-outbound).
+    _parseTrafficTotal(raw) {
+        if (!raw || typeof raw !== "object") return null;
+        const up = Number(raw.up);
+        const down = Number(raw.down);
+        const hasUp = Number.isFinite(up);
+        const hasDown = Number.isFinite(down);
+        if (!hasUp && !hasDown) return null;
+        return {
+            up: hasUp && up > 0 ? up : 0,
+            down: hasDown && down > 0 ? down : 0,
+        };
+    }
+
+    _trafficTotalChanged(next) {
+        const prev = this._trafficTotal;
+        if (!prev || !next) return Boolean(prev) !== Boolean(next);
+        return prev.up !== next.up || prev.down !== next.down;
+    }
+
+    _trafficChanged(next) {
+        const prev = this._traffic;
+        if (!prev || prev.size !== next.size) return true;
+        for (const [tag, rate] of next) {
+            const old = prev.get(tag);
+            if (!old || old.up !== rate.up || old.down !== rate.down) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Rates change every second while nothing else on the card does. Repainting
+    // the whole node list at 1 Hz would churn the DOM (and drop hover/focus on
+    // the buttons), so the numbers and the bar widths are written straight into
+    // the nodes the previous render produced. Every element is looked up by a
+    // data attribute rather than by index, so a render that reordered the rows
+    // cannot silently write a rate onto the wrong outbound.
+    _patchTrafficRates() {
+        const root = this.renderRoot;
+        if (!root || typeof root.querySelectorAll !== "function") return;
+        for (const el of root.querySelectorAll("[data-rate-for]")) {
+            this._paintRate(el, this._trafficOf(el.dataset.rateFor));
+        }
+        // The block is rebuilt from scratch on every render (the top-5 changes
+        // with the rates), so only the widths and numbers need patching here.
+        const { rows, total } = this._trafficTop();
+        const max = rows.length ? rows[0].sum : 0;
+        for (const row of root.querySelectorAll("[data-traffic-row]")) {
+            this._paintTrafficRow(
+                row,
+                this._trafficOf(row.dataset.trafficRow),
+                max
+            );
+        }
+        const el = root.querySelector(".traffic-total b");
+        if (el) el.textContent = this._formatRate(total);
+    }
+
+    _paintRate(el, rate) {
+        const up = rate ? rate.up : 0;
+        const down = rate ? rate.down : 0;
+        el.classList.toggle("idle", up + down <= 0);
+        const downEl = el.querySelector('[data-dir="down"]');
+        const upEl = el.querySelector('[data-dir="up"]');
+        if (downEl) downEl.textContent = this._formatRate(down);
+        if (upEl) upEl.textContent = this._formatRate(up);
+    }
+
+    _paintTrafficRow(row, rate, max) {
+        const up = rate ? rate.up : 0;
+        const down = rate ? rate.down : 0;
+        const total = up + down;
+        row.classList.toggle("idle", total <= 0);
+        const downEl = row.querySelector('[data-dir="down"]');
+        const upEl = row.querySelector('[data-dir="up"]');
+        if (downEl) downEl.textContent = this._formatRate(down);
+        if (upEl) upEl.textContent = this._formatRate(up);
+        const bar = row.querySelector(".traffic-bar i");
+        if (bar) bar.style.width = `${trafficShare(total, max)}%`;
+        const tag = row.dataset.trafficRow;
+        if (tag) {
+            row.title = this._t("traffic.rowTitle", {
+                tag,
+                down: this._formatRate(down),
+                up: this._formatRate(up),
+            });
+        }
+    }
+
+    // Top outbounds by their combined rate, plus the total speed shown in the
+    // header. The header total is the backend's connection total when it sent
+    // one, because the per-tag rows overlap across a proxy chain; the sum of
+    // every reported outbound (not just the visible rows) is the fallback.
+    _trafficTop() {
+        const rows = [];
+        let sum = 0;
+        for (const [tag, rate] of this._traffic) {
+            const rowSum = rate.up + rate.down;
+            sum += rowSum;
+            rows.push({ tag, up: rate.up, down: rate.down, sum: rowSum });
+        }
+        rows.sort((a, b) => b.sum - a.sum || a.tag.localeCompare(b.tag));
+        const total = this._trafficTotal
+            ? this._trafficTotal.up + this._trafficTotal.down
+            : sum;
+        return { rows: rows.slice(0, TRAFFIC_TOP_N), total };
+    }
+
     // Live url-test result of one outbound, as a number of milliseconds, the
     // PING_FAILED marker, or null when it was never measured. Three sources,
     // in order of authority:
@@ -731,7 +949,20 @@ class SingBoxPanelCard extends LitElement {
         // Only a real change repaints: like the connections poll, the ping
         // refresh must not force a paint on every tick of the throttle.
         const modelChanged = this._augmentStandalone(res);
-        if (changed || modelChanged) this._scheduleRender();
+        // Traffic is a different matter: it changes on every single tick, and
+        // repainting the card for it would defeat the render throttle (and
+        // churn the node buttons under the pointer). The numbers and the bar
+        // widths are written into the existing DOM instead; the throttle then
+        // repaints when it was going to anyway, which is also when the top-5
+        // ordering of the block is allowed to change.
+        const trafficChanged = this._applyTraffic(res);
+        if (changed || modelChanged) {
+            this._scheduleRender();
+        } else if (trafficChanged) {
+            this._patchTrafficRates();
+        } else {
+            // Same numbers: repaint neither the card nor the rates.
+        }
     }
 
     // Standalone outbounds (VPN interfaces, direct links, ...) are normally
@@ -816,7 +1047,16 @@ class SingBoxPanelCard extends LitElement {
 
     _startStatusTimer() {
         if (this._statusTimer || !this._statusSupported) return;
-        const interval = this._refreshMs() > 0 ? this._refreshMs() : 2000;
+        const configured = this._refreshMs() > 0 ? this._refreshMs() : 2000;
+        // The singbox/status answer carries the per-outbound traffic rates,
+        // which are a live number and must move once a second. One answer
+        // feeds both the rates and the url-test chips, so the poll itself is
+        // sped up rather than adding a second loop; with the traffic block
+        // switched off the old cadence is kept.
+        const interval =
+            this._config.show_traffic === false
+                ? configured
+                : Math.min(configured, 1000);
         const tick = () => {
             if (!this._statusSupported || this._detached) {
                 this._statusTimer = null;
@@ -1459,6 +1699,8 @@ class SingBoxPanelCard extends LitElement {
                       `
                     : ""}
 
+                ${this._renderTraffic()}
+
                 ${this._renderConnections()}
 
                 ${this._fallbackNote
@@ -1468,6 +1710,59 @@ class SingBoxPanelCard extends LitElement {
                       )}</div>`
                     : ""}
                 <div class="footer">sing-box panel · v${CARD_VERSION}</div>
+            </div>
+        `;
+    }
+
+    // Top outbounds by current rate. Drawn only when the integration actually
+    // reported traffic: on an older version (no "traffic" key) or the gRPC
+    // backend (available: false) there is no key in the answer and the whole
+    // block stays out of the DOM rather than showing a column of zeros.
+    _renderTraffic() {
+        if (this._config.show_traffic === false) return "";
+        if (!this._trafficAvailable) return "";
+        const { rows, total } = this._trafficTop();
+        return html`
+            <div class="traffic">
+                <div class="traffic-head">
+                    <span class="traffic-title">${this._t("traffic.title")}</span>
+                    <span class="traffic-total">
+                        ${this._t("traffic.total", { value: "" })}
+                        <b></b>
+                    </span>
+                </div>
+                ${rows.length
+                    ? html`<div class="traffic-rows">
+                          ${rows.map((row) => this._renderTrafficRow(row))}
+                      </div>`
+                    : html`<div class="traffic-empty">${this._t(
+                          "traffic.empty"
+                      )}</div>`}
+            </div>
+        `;
+    }
+
+    _renderTrafficRow(row) {
+        return html`
+            <div
+                class="traffic-row"
+                data-traffic-row=${row.tag}
+                title=${this._t("traffic.rowTitle", {
+                    tag: row.tag,
+                    down: this._formatRate(row.down),
+                    up: this._formatRate(row.up),
+                })}
+            >
+                <span class="traffic-tag">${row.tag}</span>
+                <span class="traffic-numbers">
+                    <span class="rate-dir down"
+                        >↓ <span data-dir="down"></span
+                    ></span>
+                    <span class="rate-dir"
+                        >↑ <span data-dir="up"></span
+                    ></span>
+                </span>
+                <span class="traffic-bar"><i></i></span>
             </div>
         `;
     }
@@ -1489,8 +1784,8 @@ class SingBoxPanelCard extends LitElement {
         const ms = this._ping(proxy);
         const pinging = Boolean(this._testing[proxy.tag]);
         return html`
-            <div class="node">
-                <span class="node-name standalone">${proxy.tag}</span>
+            <div class="node standalone-node">
+                ${this._nodeLabel(proxy.tag, "standalone")}
                 ${this._pingChip(ms, proxy.tag)}
                 <button
                     class="node-ping"
@@ -1567,6 +1862,34 @@ class SingBoxPanelCard extends LitElement {
         `;
     }
 
+    // Tag and, when the integration reports per-outbound traffic, its current
+    // rate underneath it. The rate is a separate element so the 1 Hz refresh
+    // can rewrite just its numbers (_patchTrafficRates) instead of repainting
+    // the whole list.
+    _nodeLabel(tag, extraClass = "") {
+        return html`
+            <span class="node-label">
+                <span class="node-name ${extraClass}">${tag}</span>
+                ${this._trafficAvailable && this._config.show_traffic !== false
+                    ? this._nodeRate(tag)
+                    : ""}
+            </span>
+        `;
+    }
+
+    _nodeRate(tag) {
+        return html`
+            <span
+                class="node-rate"
+                data-rate-for=${tag}
+                title=${this._t("traffic.rateTitle")}
+            >
+                <span class="rate-dir down">↓ <span data-dir="down"></span></span>
+                <span class="rate-dir">↑ <span data-dir="up"></span></span>
+            </span>
+        `;
+    }
+
     _renderNode(group, option, current) {
         const ms = this._ping(option);
         const active = option.tag === current;
@@ -1578,7 +1901,7 @@ class SingBoxPanelCard extends LitElement {
                     title=${this._t("selectTitle", { tag: option.tag })}
                     @click=${() => this._selectNode(group.tag, option.tag, group.entityId)}
                 >
-                    <span class="node-name">${option.tag}</span>
+                    ${this._nodeLabel(option.tag)}
                     ${this._pingChip(ms, option.tag)}
                 </button>
                 <button

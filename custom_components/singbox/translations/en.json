@@ -64,6 +64,12 @@
       },
       "downlink_total": {
         "name": "Downlink total"
+      },
+      "outbound_uplink": {
+        "name": "Outbound uplink {outbound}"
+      },
+      "outbound_downlink": {
+        "name": "Outbound downlink {outbound}"
       }
     },
     "select": {

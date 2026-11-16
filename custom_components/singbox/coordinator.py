@@ -17,7 +17,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -65,6 +66,265 @@ _PUSH_MIN_INTERVAL = 5.0
 # back (e.g. a reconnect delivering a frame immediately after the previous
 # one) while still keeping the rate meaningful.
 _MIN_RATE_WINDOW = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Per-outbound traffic attribution
+# ---------------------------------------------------------------------------
+
+# How many sample windows a tag survives after its last connection closed.
+# Dropping it immediately makes an "active now" filter flicker: a tag
+# disappears for a window whenever its last connection is closed by the
+# server, and a short grace period hides that without inventing traffic.
+_TRAFFIC_TAG_GRACE = 2
+
+# A window shorter than this is not a measurement: two snapshots delivered
+# back to back would be divided by a few milliseconds and report a nonsense
+# speed. The clash poll never runs faster than POLL_INTERVAL_SECONDS, so this
+# only guards against a reconnect delivering an extra snapshot.
+_MIN_TRAFFIC_WINDOW = 0.5
+
+# Consecutive failed polls of a healthy router are normal; without this
+# hysteresis every traffic sensor would flip to unavailable and back when a
+# single request times out.
+_TRAFFIC_STALE_AFTER = 30.0
+
+
+@dataclass(frozen=True)
+class TrafficSample:
+    """One distilled per-outbound traffic reading."""
+
+    #: tag -> (up, down) bytes per second of the window that just ended.
+    rates: dict[str, tuple[int, int]]
+    #: Summed speed over all connections. NOT the sum of ``rates``: one
+    #: connection is attributed to every tag of its outbound chain.
+    total: tuple[int, int]
+    #: ISO-8601 moment the window was closed.
+    sampled_at: str
+    #: Measured length of the window, in seconds.
+    window_seconds: float
+
+
+class OutboundTrafficSampler:
+    """Turn two connection snapshots into bytes/second per outbound tag.
+
+    sing-box has no per-outbound counter endpoint. What it does expose is the
+    full connection list, where every connection carries the outbound chain
+    that handled it plus its own cumulative byte counters. Two consecutive
+    snapshots of that list therefore reveal the traffic of every outbound: the
+    increment of the counters of a connection, attributed to each tag of its
+    chain, divided by the real elapsed time.
+
+    The rules that keep the numbers honest:
+
+    * Only connections present in both snapshots contribute. A connection seen
+      for the first time already carries the bytes of its initial burst, so
+      counting them would fabricate a spike on every new download.
+    * A negative increment counts as zero: the counters are cumulative per
+      connection and only go down when sing-box reused the id for a new one.
+    * The increment is added to every tag of the chain (group, node, leaf), so
+      the card can show the speed of a node and of the group it belongs to.
+      The per-tag numbers therefore overlap and their sum exceeds the traffic
+      of a single connection; ``total`` keeps the real figure.
+    * The rate is divided by the measured elapsed time, not by the nominal
+      poll interval, because the poll drifts.
+    * An outbound that still has a connection but moved no bytes is reported
+      with a zero rate, so the card keeps listing it between transfers.
+    * A tag whose connections are all gone keeps a zero rate for a couple of
+      windows before it is dropped, so the entity registry does not churn.
+    """
+
+    def __init__(self) -> None:
+        # id -> (upload, download) of the previous snapshot.
+        self._previous: dict[str, tuple[int, int]] = {}
+        # tag -> [up_bytes, down_bytes] accumulated since the last sample.
+        self._window: dict[str, list[int]] = {}
+        # tag -> windows left before it is dropped from the published rates.
+        self._missed: dict[str, int] = {}
+        self._window_start: float | None = None
+        self._previous_totals: tuple[int, int] | None = None
+        self._window_up = 0
+        self._window_down = 0
+        self._rates: dict[str, tuple[int, int]] = {}
+        self._total: tuple[int, int] = (0, 0)
+        self._sampled_at = ""
+        self._window_seconds = 0.0
+        self.windows = 0
+
+    # -- sampling -----------------------------------------------------------
+
+    def sample(
+        self,
+        connections: list[SingBoxConnection],
+        totals: tuple[int, int],
+        now: float,
+    ) -> TrafficSample | None:
+        """Fold one connection snapshot in and return the new sample.
+
+        Returns None for the very first snapshot (a rate needs two points in
+        time) and for one that arrives too soon after its predecessor.
+        """
+        if self._window_start is None:
+            self._remember(connections, totals, now)
+            return None
+        elapsed = now - self._window_start
+        if elapsed < _MIN_TRAFFIC_WINDOW:
+            # Keep the baseline instead of throwing the accumulated bytes away.
+            return None
+        self._accumulate(connections, totals)
+        rates = self._flush(elapsed, connections)
+        self._rates = rates
+        self._sampled_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._window_seconds = elapsed
+        self.windows += 1
+        self._remember(connections, totals, now)
+        return TrafficSample(
+            rates=dict(rates),
+            total=self._total,
+            sampled_at=self._sampled_at,
+            window_seconds=elapsed,
+        )
+
+    def _remember(
+        self,
+        connections: list[SingBoxConnection],
+        totals: tuple[int, int],
+        now: float,
+    ) -> None:
+        """Store the current snapshot as the baseline for the next one."""
+        self._previous = {
+            connection.id: (connection.upload_total, connection.download_total)
+            for connection in connections
+            if connection.id
+        }
+        self._previous_totals = totals
+        self._window_start = now
+
+    def _accumulate(
+        self,
+        connections: list[SingBoxConnection],
+        totals: tuple[int, int],
+    ) -> None:
+        """Add the per-connection increments of this window to the tag buckets."""
+        counted_up = 0
+        counted_down = 0
+        for connection in connections:
+            previous = self._previous.get(connection.id) if connection.id else None
+            if previous is None:
+                # First appearance: nothing here can be pinned to this window.
+                continue
+            up_delta = connection.upload_total - previous[0]
+            down_delta = connection.download_total - previous[1]
+            # A reset (or a reused id) is not negative traffic.
+            up_delta = up_delta if up_delta > 0 else 0
+            down_delta = down_delta if down_delta > 0 else 0
+            counted_up += up_delta
+            counted_down += down_delta
+            if not up_delta and not down_delta:
+                continue
+            # dict.fromkeys keeps the order and drops a duplicate tag: a chain
+            # naming the same outbound twice is still one attribution.
+            for tag in dict.fromkeys(connection.chain):
+                bucket = self._window.setdefault(tag, [0, 0])
+                bucket[0] += up_delta
+                bucket[1] += down_delta
+        self._window_up = counted_up
+        self._window_down = counted_down
+        self._log_discrepancy(counted_up, counted_down, totals)
+
+    def _log_discrepancy(
+        self,
+        counted_up: int,
+        counted_down: int,
+        totals: tuple[int, int],
+    ) -> None:
+        """Compare the attributed bytes with the global counter delta.
+
+        On an idle router the two nearly match; the difference is the traffic
+        of connections that closed inside the window (their bytes were counted
+        and then vanished from the snapshot). DEBUG, because it is a debugging
+        aid, not a warning.
+        """
+        if self._previous_totals is None:
+            return
+        global_up = totals[0] - self._previous_totals[0]
+        global_down = totals[1] - self._previous_totals[1]
+        if global_up < 0 or global_down < 0:
+            # sing-box restarted between the snapshots; the comparison is void.
+            return
+        _LOGGER.debug(
+            "outbound traffic window %d: counted %d up / %d down, global delta "
+            "%d up / %d down, unattributed %d up / %d down (closed connections)",
+            self.windows + 1,
+            counted_up,
+            counted_down,
+            global_up,
+            global_down,
+            global_up - counted_up,
+            global_down - counted_down,
+        )
+
+    def _flush(
+        self,
+        elapsed: float,
+        connections: list[SingBoxConnection],
+    ) -> dict[str, tuple[int, int]]:
+        """Convert the window buckets to rates and roll the tag bookkeeping."""
+        rates: dict[str, tuple[int, int]] = {
+            tag: (round(up / elapsed), round(down / elapsed))
+            for tag, (up, down) in self._window.items()
+        }
+        self._total = (round(self._window_up / elapsed), round(self._window_down / elapsed))
+        self._window = {}
+        # A tag with an idle but still open connection is not gone, it just
+        # moved no bytes - that is what a zero rate means, and reporting it
+        # keeps the card from hiding an outbound that is between transfers.
+        # Only a tag with no connection at all gets the grace countdown.
+        present = {tag for connection in connections for tag in connection.chain}
+        for tag in set(self._rates) | present:
+            if tag in rates or tag in present:
+                self._missed.pop(tag, None)
+                rates.setdefault(tag, (0, 0))
+                continue
+            missed = self._missed.get(tag, 0) + 1
+            if missed <= _TRAFFIC_TAG_GRACE:
+                self._missed[tag] = missed
+                rates[tag] = (0, 0)
+            else:
+                self._missed.pop(tag, None)
+        return rates
+
+    # -- published state ----------------------------------------------------
+
+    @property
+    def rates(self) -> dict[str, tuple[int, int]]:
+        """The latest bytes/second per outbound tag."""
+        return dict(self._rates)
+
+    @property
+    def total(self) -> tuple[int, int]:
+        """The latest summed speed over all connections."""
+        return self._total
+
+    @property
+    def sampled_at(self) -> str:
+        """ISO-8601 timestamp of the last closed window ("" before one)."""
+        return self._sampled_at
+
+    def reset(self) -> None:
+        """Forget the baseline after the backend went away or restarted."""
+        self._previous = {}
+        self._window = {}
+        self._missed = {}
+        self._window_start = None
+        self._previous_totals = None
+        self._window_up = 0
+        self._window_down = 0
+        self._rates = {}
+        self._total = (0, 0)
+        self._sampled_at = ""
+        self._window_seconds = 0.0
+        self.windows = 0
 
 
 class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
@@ -137,6 +397,28 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         # all (UNIMPLEMENTED / NOT_FOUND), so the websocket API can report
         # "not supported" instead of an empty list.
         self._connections_supported = True
+        # Per-outbound traffic. The clash backend derives it from two
+        # consecutive connection snapshots; the gRPC backend has no
+        # cumulative per-connection counters to diff (its frames are deltas
+        # with an explicit reset flag), so the sampler is left out and the
+        # feature reports itself unavailable there instead of guessing.
+        self._traffic_sampler = None if backend == BACKEND_GRPC else OutboundTrafficSampler()
+        self._traffic_listeners: list = []
+        # Tags of the live connections of the last snapshot, i.e. outbounds
+        # that currently carry traffic. Kept apart from the sampler's rates,
+        # which hold a vanished tag for a couple of windows.
+        self._traffic_tags: set[str] = set()
+        # time.monotonic() of the last completed sample, for the staleness
+        # check of outbound_traffic_available.
+        self._traffic_sample_monotonic = 0.0
+        # The payload the websocket API and the card read; kept on the
+        # snapshot so diagnostics can show it too.
+        self.data.traffic = {
+            "available": False,
+            "now": "",
+            "outbounds": {},
+            "total": {"up": 0, "down": 0},
+        }
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -477,6 +759,7 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
         # A clash snapshot already is the complete set of live connections,
         # so it replaces whatever was known instead of merging into it.
         self._set_connections(connections)
+        self._sample_outbound_traffic(connections, (upload_total, download_total))
 
     # -- snapshot updates ---------------------------------------------------
 
@@ -608,6 +891,132 @@ class SingBoxCoordinator(DataUpdateCoordinator[SingBoxStatus]):
 
     def proxy(self, tag: str) -> SingBoxGroupItem | None:
         return self._proxies_index.get(tag)
+
+    # -- per-outbound traffic -----------------------------------------------
+
+    @callback
+    def async_add_traffic_listener(self, update_callback) -> None:
+        """Register a callback invoked whenever a new traffic sample lands."""
+        self._traffic_listeners.append(update_callback)
+
+    @callback
+    def async_remove_traffic_listener(self, update_callback) -> None:
+        """Remove a traffic callback."""
+        self._traffic_listeners.remove(update_callback)
+
+    @callback
+    def _notify_traffic(self) -> None:
+        for update_callback in list(self._traffic_listeners):
+            update_callback()
+
+    def _sample_outbound_traffic(
+        self,
+        connections: list[SingBoxConnection],
+        totals: tuple[int, int],
+    ) -> None:
+        """Fold one connection snapshot into the per-outbound traffic sample.
+
+        Called right after a clash connections poll: that poll is the only
+        place where the full list (and therefore the per-connection counters)
+        is fetched anyway, so the traffic numbers cost no extra request.
+        """
+        if self._traffic_sampler is None:
+            return
+        known = self._traffic_tags
+        sample = self._traffic_sampler.sample(connections, totals, time.monotonic())
+        # The live tags come from the snapshot, not from the sample: the
+        # sample deliberately keeps a vanished tag around for a couple of
+        # windows, while "does this outbound still exist" must answer now.
+        self._traffic_tags = {tag for connection in connections for tag in connection.chain}
+        if sample is None:
+            return
+        self._traffic_sample_monotonic = time.monotonic()
+        self.data.traffic = self.traffic_payload()
+        new_tags = self._traffic_tags - known
+        if new_tags:
+            _LOGGER.debug("new outbounds with traffic: %s", ", ".join(sorted(new_tags)))
+        # Listeners first (the sensor platform creates one entity pair per new
+        # tag), then the general discovery pass so the group/proxy listeners
+        # see a subscription change in the same push.
+        self._notify_traffic()
+        if new_tags:
+            self._notify_discovery()
+
+    def traffic_payload(self) -> dict:
+        """The per-outbound traffic block of the ``singbox/status`` command.
+
+        ``available`` is False when the backend cannot report per-connection
+        counters (the gRPC backend, or a build without connection tracking):
+        the card then hides the traffic column instead of showing zeros as if
+        the router were idle. ``now`` is the moment the last window closed.
+        ``total`` is the summed speed over all connections, kept apart from
+        the per-tag numbers because one connection is attributed to every
+        outbound of its chain, so those deliberately overlap.
+        """
+        return {
+            "available": self.outbound_traffic_available,
+            "now": self.outbound_traffic_sampled_at,
+            "outbounds": {
+                tag: {"up": up, "down": down} for tag, (up, down) in self.outbound_traffic.items()
+            },
+            "total": {
+                "up": self.outbound_traffic_total[0],
+                "down": self.outbound_traffic_total[1],
+            },
+        }
+
+    @property
+    def outbound_traffic(self) -> dict[str, tuple[int, int]]:
+        """Bytes/second per outbound tag, keyed by tag (a copy).
+
+        Tags the sampler is still holding through its grace period are
+        included with a zero rate; :meth:`outbound_tags` answers which of
+        them still exist upstream.
+        """
+        if self._traffic_sampler is None:
+            return {}
+        return self._traffic_sampler.rates
+
+    @property
+    def outbound_traffic_total(self) -> tuple[int, int]:
+        """Summed bytes/second over every connection of the last window."""
+        if self._traffic_sampler is None:
+            return (0, 0)
+        return self._traffic_sampler.total
+
+    @property
+    def outbound_traffic_available(self) -> bool:
+        """True when there is a recent per-outbound sample to show.
+
+        A sample older than _TRAFFIC_STALE_AFTER is not used: the poll loop
+        may be down while the integration is still "available" on its other
+        data, and stale rates would silently look live.
+        """
+        if self._traffic_sampler is None or not self._connections_supported:
+            return False
+        if not self._traffic_sample_monotonic:
+            return False
+        return time.monotonic() - self._traffic_sample_monotonic <= _TRAFFIC_STALE_AFTER
+
+    @property
+    def outbound_traffic_sampled_at(self) -> str:
+        """ISO-8601 moment the last traffic window was closed ("" before one)."""
+        if self._traffic_sampler is None:
+            return ""
+        return self._traffic_sampler.sampled_at
+
+    def outbound_tags(self) -> list[str]:
+        """Outbound tags that carry traffic right now, in a stable order.
+
+        This is the list the sensor platform creates entities for, so it is
+        sorted: an outbound must keep the same position across restarts to
+        keep the entity registry stable.
+        """
+        return sorted(self._traffic_tags)
+
+    def has_outbound_traffic(self, tag: str) -> bool:
+        """True while this tag is part of a live connection chain."""
+        return tag in self._traffic_tags
 
     # -- control helpers (called by services/entities) ----------------------
 

@@ -193,7 +193,10 @@ async def ws_status(
           "groups": [{"tag": "...", "type": "Selector", "selectable": true,
                       "selected": "...", "items": ["..."]}],
           "proxies": [{"tag": "...", "type": "VLESS", "delay": 152,
-                       "test_time": 1730000000000, "failed": false}]
+                       "test_time": 1730000000000, "failed": false}],
+          "traffic": {"available": true, "now": "2026-11-16T19:00:00+03:00",
+                      "outbounds": {"node-a": {"up": 1024, "down": 8192}},
+                      "total": {"up": 1024, "down": 8192}}
         }
 
     ``failed`` separates "the test ran and could not reach the URL" from
@@ -246,6 +249,12 @@ async def ws_status(
                 for group in data.groups
             ],
             "proxies": proxies,
+            # Per-outbound traffic in bytes/second. Built by the coordinator
+            # from two consecutive connection snapshots; "available" is False
+            # on a backend that cannot report per-connection counters at all,
+            # so the card hides the column instead of rendering zeros as if
+            # the router were idle.
+            "traffic": coordinator.traffic_payload(),
         },
     )
 

@@ -27,6 +27,10 @@ Installed from HACS, set up from the UI, no YAML and no extra Python packages.
 - **Panel card** — a card bundled with the integration, loaded automatically,
   showing speeds, a traffic chart, per-proxy pings, the groups and the live
   connection list. Every block can be turned off from the visual editor.
+- **Traffic per outbound** — the rate of every outbound tag, taken from
+  the connection list the clash API already returns (no extra request, no
+  extra ping): a top-5 block on the card, a rate line under every node, and an
+  optional pair of sensors per outbound for dashboards and automations.
 - **Connections** — the card lists active connections with free-text search
   (host, process, outbound, rule), filters for network, protocol and outbound,
   and buttons to close one connection or all of them. A backend that cannot
@@ -165,6 +169,7 @@ record" flag, this is the only way to make the choice.
 | Uplink / Downlink | sensor | Data rate (B/s), scaled to the unit you pick |
 | Uplink total / Downlink total | sensor | Session totals |
 | \<proxy tag\> Ping | sensor | Last url-test delay in ms, one diagnostic entity per outbound; not created when state history is off |
+| Outbound uplink / downlink \<proxy tag\> | sensor | Live rate (B/s) of one outbound, measured by the integration itself; only on the clash backend, and not created when state history is off |
 | \<group tag\> | select | One per selector group. url-test and fallback groups are automatic and cannot be switched |
 | Clash mode | select | Only when the clash API is enabled |
 
@@ -193,6 +198,7 @@ keys all default to `true`, and only an explicit `false` hides a block:
 | `show_speeds` | Upload and download speed tiles |
 | `show_chart` | Traffic chart of the last five minutes |
 | `show_totals` | Traffic totals, memory and connection count |
+| `show_traffic` | Traffic per outbound: top-5 block and a rate line under every node |
 | `show_groups` | Outbound groups and standalone outbounds |
 | `show_connections` | Active connections list with filtering |
 | `show_test_all` | The "Test all" button in the header |
@@ -284,6 +290,18 @@ recorder:
       - sensor.sing_box_ping_*
 ```
 
+The per-outbound traffic sensors are the second source of writes, and a much
+noisier one: they change every second, not once per url-test. They follow the
+same rule and are not created while `Write state history` is off:
+
+```yaml
+recorder:
+  exclude:
+    entity_globs:
+      - sensor.sing_box_ping_*
+      - sensor.sing_box_outbound_*
+```
+
 ## Troubleshooting
 
 - **"Failed to connect to the sing-box API"** — the host or port is wrong, the
@@ -302,6 +320,10 @@ recorder:
   the option if you want the entity history back.
 - **The card says the connection list is unavailable** — the sing-box build does
   not expose connection tracking. Everything else on the card keeps working.
+- **The per-outbound traffic block is missing** — it needs per-connection byte
+  counters, which only the clash API reports. On the gRPC backend, and on a
+  build without connection tracking, the card hides the block instead of
+  drawing zeros, and the traffic sensors are not created.
 - **The card does not appear** — check that the integration is loaded, then
   reload the page; the card module is versioned and reloads with the page.
 

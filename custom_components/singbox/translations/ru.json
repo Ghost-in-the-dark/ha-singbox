@@ -64,6 +64,12 @@
       },
       "downlink_total": {
         "name": "Скачано всего"
+      },
+      "outbound_uplink": {
+        "name": "Исходящий трафик {outbound}"
+      },
+      "outbound_downlink": {
+        "name": "Входящий трафик {outbound}"
       }
     },
     "select": {

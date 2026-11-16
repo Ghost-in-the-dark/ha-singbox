@@ -107,6 +107,33 @@ const MESSAGES = {
         },
     },
 
+    // -- per-outbound traffic ------------------------------------------------
+    // The singbox/status answer carries a "traffic" key with the current
+    // per-outbound rate in bytes per second (see the traffic block in the
+    // card). An integration that predates it simply has no key, and the
+    // block stays hidden — hence no "unavailable" string here.
+    traffic: {
+        title: { ru: "Трафик по outbound", en: "Traffic by outbound" },
+        // The header is the live link speed, not the sum of the rows above it
+        // (those overlap across a proxy chain), so the label says "right now".
+        total: { ru: "Всего сейчас: {value}", en: "Total now: {value}" },
+        empty: {
+            ru: "Активного трафика нет",
+            en: "No active traffic",
+        },
+        // ↓ is always the download side and ↑ the upload side, exactly like
+        // the chart above; the tooltip spells it out because a bare arrow is
+        // easy to misread on a narrow card.
+        rateTitle: {
+            ru: "↓ скачивание · ↑ загрузка (в секунду)",
+            en: "↓ download · ↑ upload (per second)",
+        },
+        rowTitle: {
+            ru: "{tag}: ↓ {down} · ↑ {up}",
+            en: "{tag}: ↓ {down} · ↑ {up}",
+        },
+    },
+
     // -- connections ---------------------------------------------------------
     connections: {
         title: { ru: "Подключения", en: "Connections" },
@@ -182,6 +209,10 @@ const MESSAGES = {
         show_connections: {
             ru: "Список подключений",
             en: "Connections list",
+        },
+        show_traffic: {
+            ru: "Трафик по outbound (топ-5)",
+            en: "Traffic by outbound (top 5)",
         },
         title: { ru: "Заголовок", en: "Title" },
         language: { ru: "Язык интерфейса", en: "Interface language" },
